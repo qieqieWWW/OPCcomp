@@ -1,0 +1,192 @@
+# 销售部技能配置：聚焦销售策略、客户沟通、成交转化
+
+department:
+  name: "sales"
+  chinese_name: "销售部"
+  description: "负责线索管理、客户沟通、销售转化与跟进执行"
+  priority: 5
+
+skills:
+  - name: "lead-generator"
+    description: "挖掘潜在客户线索"
+    category: "其他工具"
+    parameters:
+      - name: "industry"
+        type: "string"
+        required: true
+        description: "目标行业"
+      - name: "company_size"
+        type: "string"
+        required: false
+        description: "公司规模"
+        default: "10-200"
+    usage:
+      - "批量生成潜客名单"
+      - "按行业筛选线索"
+    examples:
+      - input:
+          industry: "跨境电商"
+        output:
+          leads: 56
+
+  - name: "email-sender"
+    description: "发送销售触达邮件"
+    category: "通信工具"
+    parameters:
+      - name: "to"
+        type: "array"
+        required: true
+        description: "收件人列表"
+      - name: "subject"
+        type: "string"
+        required: true
+        description: "邮件主题"
+      - name: "body"
+        type: "string"
+        required: true
+        description: "邮件正文"
+    usage:
+      - "首轮销售触达"
+      - "发送试用邀请"
+    examples:
+      - input:
+          to: ["ceo@demo.com"]
+          subject: "邀您试用一人公司AI系统"
+          body: "您好，我们可以帮助..."
+        output:
+          sent: 1
+
+  - name: "chatbot"
+    description: "销售咨询机器人"
+    category: "通信工具"
+    parameters:
+      - name: "conversation_goal"
+        type: "string"
+        required: true
+        description: "对话目标"
+      - name: "knowledge_base"
+        type: "string"
+        required: false
+        description: "知识库ID"
+    usage:
+      - "接待客户咨询"
+      - "收集客户需求"
+    examples:
+      - input:
+          conversation_goal: "预约演示"
+        output:
+          intent: "book_demo"
+
+  - name: "crm-integration"
+    description: "CRM系统写入与同步"
+    category: "通信工具"
+    parameters:
+      - name: "action"
+        type: "string"
+        required: true
+        description: "create/update/sync"
+      - name: "payload"
+        type: "object"
+        required: true
+        description: "客户或商机数据"
+    usage:
+      - "创建商机"
+      - "更新成交阶段"
+    examples:
+      - input:
+          action: "create"
+          payload:
+            company: "Demo Inc"
+        output:
+          crm_id: "CRM-1024"
+
+  - name: "follow-up-scheduler"
+    description: "销售跟进计划安排"
+    category: "其他工具"
+    parameters:
+      - name: "lead_id"
+        type: "string"
+        required: true
+        description: "线索ID"
+      - name: "cadence_days"
+        type: "array"
+        required: true
+        description: "跟进节奏（天）"
+    usage:
+      - "安排多轮触达"
+      - "防止线索流失"
+    examples:
+      - input:
+          lead_id: "L-991"
+          cadence_days: [1, 3, 7]
+        output:
+          plan_id: "FU-44"
+
+  - name: "calendar-scheduler"
+    description: "安排销售会议与日程"
+    category: "其他工具"
+    parameters:
+      - name: "participants"
+        type: "array"
+        required: true
+        description: "参与人"
+      - name: "time_range"
+        type: "string"
+        required: true
+        description: "时间范围"
+    usage:
+      - "安排演示会议"
+      - "安排合同沟通"
+    examples:
+      - input:
+          participants: ["alice@demo.com", "sales@opc.com"]
+          time_range: "2026-04-10T10:00~12:00"
+        output:
+          event_id: "CAL-77"
+
+  - name: "sentiment-analyzer"
+    description: "分析客户对话情绪"
+    category: "分析工具"
+    parameters:
+      - name: "messages"
+        type: "array"
+        required: true
+        description: "客户沟通文本"
+      - name: "target"
+        type: "string"
+        required: false
+        description: "分析目标"
+        default: "deal_risk"
+    usage:
+      - "识别流失风险客户"
+      - "识别高意向客户"
+    examples:
+      - input:
+          messages: ["预算有限", "但非常感兴趣"]
+        output:
+          intent_level: "medium-high"
+
+  - name: "task-manager"
+    description: "销售任务拆解与推进"
+    category: "其他工具"
+    parameters:
+      - name: "task_title"
+        type: "string"
+        required: true
+        description: "任务标题"
+      - name: "owner"
+        type: "string"
+        required: true
+        description: "负责人"
+    usage:
+      - "推进销售漏斗任务"
+      - "同步执行进度"
+    dependencies:
+      - "crm-integration"
+      - "follow-up-scheduler"
+    examples:
+      - input:
+          task_title: "推进Demo Inc签约"
+          owner: "sales-01"
+        output:
+          task_id: "S-TASK-15"

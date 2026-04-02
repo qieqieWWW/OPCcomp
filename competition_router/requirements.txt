@@ -1,0 +1,1 @@
+# Stdlib-only initial scaffold; no external dependencies required.

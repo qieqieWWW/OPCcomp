@@ -1,0 +1,189 @@
+# 战略部技能配置：聚焦市场分析、商业模式、竞争策略
+
+department:
+  name: "strategy"
+  chinese_name: "战略部"
+  description: "负责市场分析、商业模式设计与竞争策略制定"
+  priority: 2
+
+skills:
+  - name: "market-research-tool"
+    description: "开展行业与用户调研"
+    category: "分析工具"
+    parameters:
+      - name: "industry"
+        type: "string"
+        required: true
+        description: "目标行业"
+      - name: "region"
+        type: "string"
+        required: false
+        description: "调研区域"
+        default: "China"
+    usage:
+      - "评估目标赛道增长趋势"
+      - "识别细分市场机会"
+    examples:
+      - input:
+          industry: "AI运营"
+        output:
+          growth_rate: "18%"
+
+  - name: "competitor-analysis"
+    description: "竞品能力与策略分析"
+    category: "分析工具"
+    parameters:
+      - name: "competitors"
+        type: "array"
+        required: true
+        description: "竞品列表"
+      - name: "dimensions"
+        type: "array"
+        required: false
+        description: "分析维度"
+        default: ["产品", "价格", "渠道"]
+    usage:
+      - "比较竞品定价与渠道"
+      - "识别差异化机会"
+    examples:
+      - input:
+          competitors: ["A产品", "B产品"]
+        output:
+          advantage: "交付速度更快"
+
+  - name: "swot-analysis"
+    description: "SWOT分析"
+    category: "分析工具"
+    parameters:
+      - name: "internal_factors"
+        type: "array"
+        required: true
+        description: "内部因素"
+      - name: "external_factors"
+        type: "array"
+        required: true
+        description: "外部因素"
+    usage:
+      - "形成战略决策依据"
+      - "明确机会和威胁"
+    examples:
+      - input:
+          internal_factors: ["模型路由能力"]
+          external_factors: ["行业需求增长"]
+        output:
+          strategy: "优先切入中小企业客户"
+
+  - name: "database-query"
+    description: "查询行业数据库与历史指标"
+    category: "数据库查询"
+    parameters:
+      - name: "query"
+        type: "string"
+        required: true
+        description: "SQL或查询语句"
+      - name: "source"
+        type: "string"
+        required: true
+        description: "数据源名称"
+    usage:
+      - "查询市场规模历史数据"
+      - "提取用户留存数据"
+    examples:
+      - input:
+          source: "industry_dw"
+          query: "SELECT * FROM market_size LIMIT 10"
+        output:
+          rows: 10
+
+  - name: "financial-analyzer"
+    description: "财务测算与盈利模型评估"
+    category: "分析工具"
+    parameters:
+      - name: "assumptions"
+        type: "object"
+        required: true
+        description: "收入、成本、增长假设"
+      - name: "period_months"
+        type: "number"
+        required: false
+        description: "测算周期（月）"
+        default: 24
+    usage:
+      - "估算盈亏平衡点"
+      - "评估不同定价策略"
+    examples:
+      - input:
+          assumptions:
+            arpu: 299
+            churn: 0.03
+        output:
+          breakeven_month: 14
+
+  - name: "news-aggregator"
+    description: "聚合行业新闻和政策变化"
+    category: "网络爬虫"
+    parameters:
+      - name: "keywords"
+        type: "array"
+        required: true
+        description: "新闻关键词"
+      - name: "days"
+        type: "number"
+        required: false
+        description: "近N天新闻"
+        default: 7
+    usage:
+      - "跟踪行业动态"
+      - "监控监管政策变化"
+    examples:
+      - input:
+          keywords: ["AI运营", "企业自动化"]
+        output:
+          articles: 22
+
+  - name: "report-writer"
+    description: "输出战略报告"
+    category: "内容生成"
+    parameters:
+      - name: "report_type"
+        type: "string"
+        required: true
+        description: "战略报告类型"
+      - name: "input_data"
+        type: "object"
+        required: true
+        description: "报告原始输入"
+    usage:
+      - "生成季度战略建议"
+      - "生成商业模式评审报告"
+    dependencies:
+      - "market-research-tool"
+      - "financial-analyzer"
+    examples:
+      - input:
+          report_type: "quarterly_strategy"
+          input_data:
+            focus: "中小企业"
+        output:
+          summary: "建议优先布局私域渠道"
+
+  - name: "api-caller"
+    description: "调用外部行业/金融API"
+    category: "数据库查询"
+    parameters:
+      - name: "endpoint"
+        type: "string"
+        required: true
+        description: "API地址"
+      - name: "payload"
+        type: "object"
+        required: false
+        description: "请求参数"
+    usage:
+      - "同步外部指数数据"
+      - "获取宏观行业指标"
+    examples:
+      - input:
+          endpoint: "https://api.example.com/index"
+        output:
+          status: "ok"

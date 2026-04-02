@@ -1,0 +1,38 @@
+[
+  {
+    "id": "risk_model_cashflow_safety_margin",
+    "title": "现金流安全边际基准",
+    "category": "risk_model",
+    "industry": "通用",
+    "keywords": ["现金流", "净流出", "runway", "安全边际"],
+    "tags": ["风险模型", "财务"],
+    "guideline": "当现金流压力上升时，优先守住生存线，再做增长实验。"
+  },
+  {
+    "id": "industry_b2b_saas_retention",
+    "title": "B2B SaaS 留存优先策略",
+    "category": "industry_standard",
+    "industry": "B2B SaaS",
+    "keywords": ["留存", "续费", "SaaS", "流失"],
+    "tags": ["行业标准", "增长"],
+    "guideline": "优先修复留存漏斗，再放大获客预算。"
+  },
+  {
+    "id": "case_crossborder_policy_shock",
+    "title": "跨境业务政策波动应对",
+    "category": "success_case",
+    "industry": "跨境电商",
+    "keywords": ["跨境", "政策", "平台", "渠道"],
+    "tags": ["案例", "风控"],
+    "guideline": "建立渠道冗余，避免单点依赖。"
+  },
+  {
+    "id": "ops_milestone_execution",
+    "title": "里程碑化执行管理",
+    "category": "industry_standard",
+    "industry": "通用",
+    "keywords": ["里程碑", "执行", "排期", "资源"],
+    "tags": ["运营", "管理"],
+    "guideline": "把目标拆成可验证里程碑，按周校准。"
+  }
+]

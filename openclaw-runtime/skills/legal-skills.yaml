@@ -1,0 +1,169 @@
+# 法务部技能配置：聚焦法律风险评估、合规检查、知识产权保护
+
+department:
+  name: "legal"
+  chinese_name: "法务部"
+  description: "负责法律风险评估、合规检查、知识产权策略与合同把关"
+  priority: 3
+
+skills:
+  - name: "compliance-checker"
+    description: "合规规则检查"
+    category: "分析工具"
+    parameters:
+      - name: "documents"
+        type: "array"
+        required: true
+        description: "待检查文档列表"
+      - name: "jurisdiction"
+        type: "string"
+        required: false
+        description: "适用法域"
+        default: "CN"
+    usage:
+      - "检查隐私政策合规性"
+      - "检查产品条款合规性"
+    examples:
+      - input:
+          documents: ["privacy.md", "terms.md"]
+        output:
+          issues: 3
+
+  - name: "risk-assessment"
+    description: "法律风险分级评估"
+    category: "分析工具"
+    parameters:
+      - name: "risk_context"
+        type: "object"
+        required: true
+        description: "业务场景与合同背景"
+      - name: "scale"
+        type: "string"
+        required: false
+        description: "评分标准"
+        default: "5-level"
+    usage:
+      - "评估合同违约风险"
+      - "评估数据处理风险"
+    examples:
+      - input:
+          risk_context:
+            scenario: "SaaS订阅"
+        output:
+          high_risk: ["数据处理责任边界"]
+
+  - name: "browser-automation"
+    description: "自动化查询法规网站"
+    category: "网络爬虫"
+    parameters:
+      - name: "start_url"
+        type: "string"
+        required: true
+        description: "法律网站入口"
+      - name: "actions"
+        type: "array"
+        required: true
+        description: "页面自动化动作"
+    usage:
+      - "自动检索法规更新"
+      - "抓取监管公告"
+    examples:
+      - input:
+          start_url: "https://example.gov.cn"
+          actions: ["search:数据安全法"]
+        output:
+          hits: 5
+
+  - name: "api-caller"
+    description: "调用法律数据库API"
+    category: "数据库查询"
+    parameters:
+      - name: "endpoint"
+        type: "string"
+        required: true
+        description: "API endpoint"
+      - name: "headers"
+        type: "object"
+        required: false
+        description: "请求头"
+    usage:
+      - "查询司法案例"
+      - "查询法规版本历史"
+    examples:
+      - input:
+          endpoint: "https://law-api.example.com/cases"
+        output:
+          records: 12
+
+  - name: "document-analyzer"
+    description: "合同条款与法律文本解析（扩展技能）"
+    category: "文档处理"
+    parameters:
+      - name: "document_text"
+        type: "string"
+        required: true
+        description: "合同或条款文本"
+      - name: "focus_terms"
+        type: "array"
+        required: false
+        description: "重点条款关键词"
+    usage:
+      - "识别高风险条款"
+      - "提取责任边界与违约条件"
+    dependencies:
+      - "pdf-parser"
+      - "docx-parser"
+    examples:
+      - input:
+          document_text: "甲方应在..."
+          focus_terms: ["赔偿", "违约"]
+        output:
+          clauses: ["违约责任条款风险较高"]
+
+  - name: "pdf-parser"
+    description: "解析法律PDF文档"
+    category: "文档处理"
+    parameters:
+      - name: "file_path"
+        type: "string"
+        required: true
+        description: "文档路径"
+      - name: "output_format"
+        type: "string"
+        required: false
+        description: "输出格式"
+        default: "text"
+    usage:
+      - "解析法律意见书"
+      - "读取法规全文"
+    examples:
+      - input:
+          file_path: "legal/opinion.pdf"
+        output:
+          pages: 18
+
+  - name: "report-writer"
+    description: "输出法务审查报告"
+    category: "内容生成"
+    parameters:
+      - name: "template"
+        type: "string"
+        required: true
+        description: "报告模板"
+      - name: "input_data"
+        type: "object"
+        required: true
+        description: "法务检查结果"
+    usage:
+      - "输出合规风险报告"
+      - "输出法律整改清单"
+    dependencies:
+      - "compliance-checker"
+      - "risk-assessment"
+    examples:
+      - input:
+          template: "compliance_audit"
+          input_data:
+            issues: 3
+        output:
+          summary: "建议两周内完成整改"

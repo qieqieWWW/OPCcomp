@@ -1,0 +1,170 @@
+# 研发部技能配置：聚焦技术分析、专利解析、可行性评估
+
+department:
+  name: "research"
+  chinese_name: "研发部"
+  description: "负责技术分析、专利解析、可行性评估，为技术决策提供依据"
+  priority: 1
+
+skills:
+  - name: "pdf-parser"
+    description: "解析专利PDF、技术报告、论文"
+    category: "文档处理"
+    parameters:
+      - name: "file_path"
+        type: "string"
+        required: true
+        description: "PDF文件路径或URL"
+      - name: "output_format"
+        type: "string"
+        required: false
+        description: "输出格式 text/markdown/json"
+        default: "markdown"
+    usage:
+      - "解析专利说明书并抽取技术要点"
+      - "从论文中提取实验结论"
+    examples:
+      - input:
+          file_path: "patents/CN123456.pdf"
+          output_format: "markdown"
+        output:
+          summary: "提取出3项核心创新点"
+
+  - name: "web-scraper"
+    description: "抓取公开网页技术资料"
+    category: "网络爬虫"
+    parameters:
+      - name: "urls"
+        type: "array"
+        required: true
+        description: "目标网页URL列表"
+      - name: "extract_selector"
+        type: "string"
+        required: false
+        description: "页面内容提取选择器"
+    usage:
+      - "收集竞品技术博客"
+      - "追踪开源项目更新"
+    examples:
+      - input:
+          urls: ["https://example.com/tech"]
+        output:
+          pages: 1
+          highlights: ["新增模型压缩方案"]
+
+  - name: "knowledge-graph-builder"
+    description: "构建技术知识图谱"
+    category: "数据库查询"
+    parameters:
+      - name: "entities"
+        type: "array"
+        required: true
+        description: "实体列表，如模型、算法、组件"
+      - name: "relations"
+        type: "array"
+        required: true
+        description: "关系三元组"
+    usage:
+      - "沉淀技术栈依赖关系"
+      - "追踪专利与产品模块映射"
+    examples:
+      - input:
+          entities: ["Qwen3", "Router", "Evaluator"]
+          relations: [["Qwen3", "serves", "Router"]]
+        output:
+          graph_nodes: 3
+          graph_edges: 1
+
+  - name: "file-manager"
+    description: "管理研发文档与分析结果"
+    category: "文档处理"
+    parameters:
+      - name: "action"
+        type: "string"
+        required: true
+        description: "upload/download/move/archive"
+      - name: "path"
+        type: "string"
+        required: true
+        description: "目标文件路径"
+    usage:
+      - "归档技术评估报告"
+      - "按项目分类存储专利材料"
+    examples:
+      - input:
+          action: "archive"
+          path: "reports/tech_eval.md"
+        output:
+          status: "ok"
+
+  - name: "risk-assessment"
+    description: "技术风险识别与分级"
+    category: "分析工具"
+    parameters:
+      - name: "risk_items"
+        type: "array"
+        required: true
+        description: "风险点列表"
+      - name: "scoring_method"
+        type: "string"
+        required: false
+        description: "评分方法"
+        default: "impact_probability"
+    usage:
+      - "评估部署稳定性风险"
+      - "评估数据质量风险"
+    examples:
+      - input:
+          risk_items: ["数据漂移", "推理延迟"]
+        output:
+          high_risk: ["数据漂移"]
+
+  - name: "code-generator"
+    description: "生成研发验证代码与脚本"
+    category: "内容生成"
+    parameters:
+      - name: "language"
+        type: "string"
+        required: true
+        description: "代码语言，如 python/typescript"
+      - name: "requirement"
+        type: "string"
+        required: true
+        description: "代码需求说明"
+    usage:
+      - "生成PoC代码"
+      - "生成自动化测试脚本"
+    dependencies:
+      - "risk-assessment"
+    examples:
+      - input:
+          language: "python"
+          requirement: "生成模型推理压测脚本"
+        output:
+          file: "benchmark.py"
+
+  - name: "report-writer"
+    description: "输出研发结论报告"
+    category: "内容生成"
+    parameters:
+      - name: "report_type"
+        type: "string"
+        required: true
+        description: "报告类型 technical_review/feasibility"
+      - name: "input_data"
+        type: "object"
+        required: true
+        description: "报告输入数据"
+    usage:
+      - "输出可行性评估报告"
+      - "输出技术路线建议"
+    dependencies:
+      - "pdf-parser"
+      - "risk-assessment"
+    examples:
+      - input:
+          report_type: "feasibility"
+          input_data:
+            score: 82
+        output:
+          conclusion: "建议进入MVP阶段"

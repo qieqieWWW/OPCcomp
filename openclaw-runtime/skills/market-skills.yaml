@@ -1,0 +1,215 @@
+# 市场部技能配置：聚焦营销策划、内容创作、品牌建设
+
+department:
+  name: "market"
+  chinese_name: "市场部"
+  description: "负责营销策划、内容创作、品牌定位与传播增长"
+  priority: 4
+
+skills:
+  - name: "content-generator"
+    description: "营销内容生成（扩展技能，可映射 text-generator）"
+    category: "内容生成"
+    parameters:
+      - name: "content_type"
+        type: "string"
+        required: true
+        description: "内容类型 article/post/script"
+      - name: "topic"
+        type: "string"
+        required: true
+        description: "内容主题"
+      - name: "tone"
+        type: "string"
+        required: false
+        description: "语气风格"
+        default: "专业"
+    usage:
+      - "生成品牌文章"
+      - "生成活动文案"
+    examples:
+      - input:
+          content_type: "post"
+          topic: "一人公司AI系统"
+        output:
+          title: "老板的AI团队上线了"
+
+  - name: "social-media-scraper"
+    description: "抓取社交媒体热点与反馈"
+    category: "网络爬虫"
+    parameters:
+      - name: "platforms"
+        type: "array"
+        required: true
+        description: "平台列表"
+      - name: "keywords"
+        type: "array"
+        required: true
+        description: "关键词"
+    usage:
+      - "追踪热点话题"
+      - "分析用户反馈"
+    examples:
+      - input:
+          platforms: ["xiaohongshu", "douyin"]
+          keywords: ["AI办公"]
+        output:
+          trend_score: 78
+
+  - name: "email-generator"
+    description: "生成营销邮件内容"
+    category: "内容生成"
+    parameters:
+      - name: "audience"
+        type: "string"
+        required: true
+        description: "目标受众"
+      - name: "goal"
+        type: "string"
+        required: true
+        description: "邮件目标"
+    usage:
+      - "促活邮件"
+      - "活动邀约邮件"
+    examples:
+      - input:
+          audience: "创业者"
+          goal: "邀请体验"
+        output:
+          subject: "邀请你体验一人公司AI系统"
+
+  - name: "ppt-maker"
+    description: "制作营销演示PPT"
+    category: "内容生成"
+    parameters:
+      - name: "outline"
+        type: "array"
+        required: true
+        description: "PPT大纲"
+      - name: "style"
+        type: "string"
+        required: false
+        description: "视觉风格"
+        default: "business"
+    usage:
+      - "路演材料制作"
+      - "客户方案演示"
+    examples:
+      - input:
+          outline: ["痛点", "方案", "案例", "报价"]
+        output:
+          slides: 18
+
+  - name: "video-generator"
+    description: "生成营销短视频脚本/素材"
+    category: "内容生成"
+    parameters:
+      - name: "duration_sec"
+        type: "number"
+        required: true
+        description: "视频时长"
+      - name: "message"
+        type: "string"
+        required: true
+        description: "核心信息"
+    usage:
+      - "制作产品介绍短视频"
+      - "制作活动预热视频"
+    examples:
+      - input:
+          duration_sec: 45
+          message: "AI团队替你完成日常经营"
+        output:
+          scenes: 6
+
+  - name: "image-generator"
+    description: "生成营销海报与配图"
+    category: "内容生成"
+    parameters:
+      - name: "prompt"
+        type: "string"
+        required: true
+        description: "图片生成提示词"
+      - name: "size"
+        type: "string"
+        required: false
+        description: "尺寸"
+        default: "1024x1024"
+    usage:
+      - "活动海报设计"
+      - "社媒封面图制作"
+    examples:
+      - input:
+          prompt: "科技感蓝色海报，主题是一人公司AI系统"
+        output:
+          image_url: "https://cdn.example.com/market-001.png"
+
+  - name: "news-aggregator"
+    description: "聚合行业新闻"
+    category: "网络爬虫"
+    parameters:
+      - name: "keywords"
+        type: "array"
+        required: true
+        description: "关键词"
+      - name: "limit"
+        type: "number"
+        required: false
+        description: "返回数量"
+        default: 20
+    usage:
+      - "跟踪行业舆情"
+      - "生成选题库"
+    examples:
+      - input:
+          keywords: ["AI Agent", "企业自动化"]
+        output:
+          collected: 20
+
+  - name: "sentiment-analyzer"
+    description: "分析用户情绪倾向"
+    category: "分析工具"
+    parameters:
+      - name: "texts"
+        type: "array"
+        required: true
+        description: "用户评论文本数组"
+      - name: "granularity"
+        type: "string"
+        required: false
+        description: "粒度"
+        default: "document"
+    usage:
+      - "评估活动反馈"
+      - "识别负面评论"
+    examples:
+      - input:
+          texts: ["功能很强", "上手略复杂"]
+        output:
+          positive_ratio: 0.61
+
+  - name: "report-writer"
+    description: "输出营销复盘报告"
+    category: "内容生成"
+    parameters:
+      - name: "metrics"
+        type: "object"
+        required: true
+        description: "传播指标"
+      - name: "period"
+        type: "string"
+        required: true
+        description: "复盘周期"
+    usage:
+      - "输出周报"
+      - "输出活动复盘"
+    dependencies:
+      - "social-media-scraper"
+      - "sentiment-analyzer"
+    examples:
+      - input:
+          metrics:
+            leads: 123
+          period: "2026-W14"
+        output:
+          conclusion: "内容结构有效，建议加大短视频投入"
