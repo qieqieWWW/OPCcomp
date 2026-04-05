@@ -31,7 +31,7 @@ skills:
           summary: "提取出3项核心创新点"
 
   - name: "web-scraper"
-    description: "抓取公开网页技术资料"
+    description: "抓取公开网页技术资料（可承接百度检索结果链接）"
     category: "网络爬虫"
     parameters:
       - name: "urls"
@@ -45,12 +45,39 @@ skills:
     usage:
       - "收集竞品技术博客"
       - "追踪开源项目更新"
+      - "抓取百度搜索命中页面并整理摘要"
     examples:
       - input:
           urls: ["https://example.com/tech"]
         output:
           pages: 1
           highlights: ["新增模型压缩方案"]
+
+  - name: "browser-automation"
+    description: "自动化浏览器操作（支持百度搜索等页面交互）"
+    category: "网络爬虫"
+    parameters:
+      - name: "start_url"
+        type: "string"
+        required: true
+        description: "浏览器起始地址"
+      - name: "actions"
+        type: "array"
+        required: true
+        description: "自动化动作序列"
+      - name: "options"
+        type: "object"
+        required: false
+        description: "附加参数（关键词/命中数等）"
+    usage:
+      - "打开百度并执行关键词搜索"
+      - "提取搜索结果标题、链接和摘要"
+    examples:
+      - input:
+          start_url: "https://www.baidu.com"
+          actions: ["type:selector=input[name='wd'], value=AI创业项目", "click:selector=input[type='submit']"]
+        output:
+          results: 5
 
   - name: "knowledge-graph-builder"
     description: "构建技术知识图谱"

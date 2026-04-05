@@ -68,13 +68,16 @@ export class ContextManager implements BlackboardClient {
     if (!task) {
       return null;
     }
-    return {
+    const taskInfo: TaskInfo = {
       taskId: task.taskId,
       bossInstruction: task.bossInstruction,
       complexity: task.complexity,
       priority: task.priority,
-      deadline: task.deadline,
     };
+    if (task.deadline !== undefined) {
+      taskInfo.deadline = task.deadline;
+    }
+    return taskInfo;
   }
 
   async getDepartmentOutput(taskId: string, department: DepartmentName): Promise<DepartmentOutput | null> {
@@ -82,15 +85,20 @@ export class ContextManager implements BlackboardClient {
     if (!doc) {
       return null;
     }
-    return {
+    const output: DepartmentOutput = {
       department: doc.department,
       taskId: doc.taskId,
       output: doc.output,
       status: doc.status,
-      score: doc.score,
       timestamp: doc.timestamp,
-      metadata: doc.metadata,
     };
+    if (doc.score !== undefined) {
+      output.score = doc.score;
+    }
+    if (doc.metadata !== undefined) {
+      output.metadata = doc.metadata;
+    }
+    return output;
   }
 
   async saveDepartmentOutput(output: DepartmentOutput): Promise<void> {

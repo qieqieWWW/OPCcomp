@@ -44,13 +44,13 @@ export class AgentExecutor {
       const output = await agent.run();
       if (status) {
         status.succeeded.push(agent.getDepartment());
-        status.current = undefined;
+        delete status.current;
       }
       return output;
     } catch (error) {
       if (status) {
         status.failed.push(agent.getDepartment());
-        status.current = undefined;
+        delete status.current;
       }
       throw error;
     } finally {

@@ -122,6 +122,67 @@ skills:
         output:
           scenes: 6
 
+  - name: "browser-automation"
+    description: "自动化浏览器操作（用于不同视频AI网页的通用执行）"
+    category: "网络爬虫"
+    parameters:
+      - name: "start_url"
+        type: "string"
+        required: true
+        description: "浏览器起始地址"
+      - name: "actions"
+        type: "array"
+        required: true
+        description: "自动化动作序列"
+      - name: "options"
+        type: "object"
+        required: false
+        description: "附加参数（时长/清晰度/幂等键）"
+    usage:
+      - "访问任意视频AI网页并提交生成任务"
+      - "抓取生成结果链接或文件ID"
+    examples:
+      - input:
+          start_url: "https://jimeng.jianying.com/ai-tool/home/"
+          actions: ["click:视频生成", "type:prompt", "click:生成"]
+        output:
+          status: "submitted"
+
+  - name: "jimeng-video-generator"
+    description: "调用即梦网页自动化链路生成营销视频（可作为多平台实现样例）"
+    category: "内容生成"
+    parameters:
+      - name: "prompt"
+        type: "string"
+        required: true
+        description: "视频生成提示词"
+      - name: "duration_sec"
+        type: "number"
+        required: false
+        description: "视频时长"
+        default: 15
+      - name: "resolution"
+        type: "string"
+        required: false
+        description: "清晰度"
+        default: "1920x1080"
+      - name: "idempotency_key"
+        type: "string"
+        required: false
+        description: "任务幂等键"
+    dependencies:
+      - "browser-automation"
+    usage:
+      - "通过即梦网页生成营销短视频"
+      - "返回视频链接和任务回执"
+    examples:
+      - input:
+          prompt: "科技感短视频，展示AI运营系统"
+          duration_sec: 15
+          resolution: "1920x1080"
+        output:
+          video_url: "https://jimeng.example/video/abc"
+
   - name: "image-generator"
     description: "生成营销海报与配图"
     category: "内容生成"

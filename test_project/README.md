@@ -1,4 +1,4 @@
-# OPC AIS API Test Project
+# OPCcomp AIS API Test Project
 
 ## Files
 - `call_ais_service.py`: AIS V2/V1 chat completion test client.
@@ -9,17 +9,17 @@
 
 ### 1) V2 (as requested)
 ```bash
-python OPC/test_project/call_ais_service.py --version v2 --host http://10.7.88.150:8080 --model test --text "你好，测试V2接口。"
+python OPCcomp/test_project/call_ais_service.py --version v2 --host http://10.7.88.150:8080 --model test --text "你好，测试V2接口。"
 ```
 
 ### 2) V1 check
 ```bash
-python OPC/test_project/call_ais_service.py --version v1 --host http://10.7.88.150:8080 --model test --text "你好，测试V1接口。"
+python OPCcomp/test_project/call_ais_service.py --version v1 --host http://10.7.88.150:8080 --model test --text "你好，测试V1接口。"
 ```
 
 ### 3) If authorization is enabled
 ```bash
-python OPC/test_project/call_ais_service.py --version v2 --host http://10.7.88.150:8080 --model test --api-key "<your-api-key>"
+python OPCcomp/test_project/call_ais_service.py --version v2 --host http://10.7.88.150:8080 --model test --api-key "<your-api-key>"
 ```
 
 ### 4) No-auth service
