@@ -81,10 +81,7 @@ class FeishuLonglinkBot {
   }
 
   start(): Promise<void> {
-    const eventDispatcher = new Lark.EventDispatcher({
-      appId: this.appId,
-      appSecret: this.appSecret,
-    });
+    const eventDispatcher = new Lark.EventDispatcher({});
 
     eventDispatcher.register({
       "im.message.receive_v1": async (data: unknown) => {
