@@ -219,6 +219,9 @@ export interface AggregatedRuntimeResult {
 export interface BrainRouterOutput {
   small_model?: {
     tier?: string;
+    score?: number;
+    backend?: string;
+    backend_reason?: string;
   };
   selected_experts?: Array<Record<string, unknown>>;
   collaboration_plan?: {

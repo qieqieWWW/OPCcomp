@@ -1,4 +1,39 @@
-openclaw/
-deepseek-api.txt
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local environment files and secrets
+.env
+.env.*
+!.env.example
 competition_router/.env
+deepseek-api.txt
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Node / frontend artifacts
 node_modules/
+*.tsbuildinfo
+coverage/
+dist/
+build/
+
+# Logs and runtime output
+logs/
+*.log
+*.pid
+
+# Local workspace metadata
+.workbuddy/
+
+openclaw/

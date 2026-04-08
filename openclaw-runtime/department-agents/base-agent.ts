@@ -6,6 +6,7 @@ export interface TaskInfo {
   complexity: "simple" | "medium" | "complex";
   priority: number;
   deadline?: Date;
+  metadata?: Record<string, unknown>;
 }
 
 export interface DepartmentOutput {

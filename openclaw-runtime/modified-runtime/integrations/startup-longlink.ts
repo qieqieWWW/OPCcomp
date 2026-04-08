@@ -1,6 +1,8 @@
 /// <reference types="node" />
 
 import * as Lark from "@larksuiteoapi/node-sdk";
+import * as fs from "fs";
+import * as path from "path";
 
 type MessageReceiveEvent = {
   event?: {
@@ -17,8 +19,17 @@ type MessageReceiveEvent = {
 };
 
 type RuntimeExecuteResponse = {
+  ok?: boolean;
+  error?: string;
+  message?: string;
   result?: string;
 };
+
+class RuntimeCallError extends Error {
+  code?: string;
+}
+
+loadDotEnv();
 
 type BotMessageEvent = {
   message: {
@@ -38,6 +49,11 @@ type BotReplyPayload = {
     text: string;
   };
 };
+
+const processedEventKeys = new Map<string, number>();
+const MESSAGE_DEDUP_WINDOW_MS = 5 * 60 * 1000; // 扩大到 5 分钟，防止飞书延迟重投
+// 正在处理中的消息 key，防止并发竞态
+const processingKeys = new Set<string>();
 
 class FeishuLonglinkBot {
   private readonly client: Lark.Client;
@@ -86,7 +102,7 @@ class FeishuLonglinkBot {
     eventDispatcher.register({
       "im.message.receive_v1": async (data: unknown) => {
         // eslint-disable-next-line no-console
-        console.log("[feishu-longlink] 事件触发 im.message.receive_v1", JSON.stringify(data).slice(0, 200));
+        console.log("[feishu-longlink] 事件触发 im.message.receive_v1", JSON.stringify(data, null, 2));
 
         if (!this.messageHandler) {
           // eslint-disable-next-line no-console
@@ -94,28 +110,76 @@ class FeishuLonglinkBot {
           return;
         }
 
-        const msgData = data as MessageReceiveEvent;
-        const messageType = msgData.event?.message?.message_type ?? "";
-        const content = msgData.event?.message?.content ?? "";
-        const openId = msgData.event?.sender?.sender_id?.open_id ?? "";
-
-        if (!openId || !messageType) {
+        // 飞书 SDK v2.0 事件结构：
+        // message 和 sender 都在根级别
+        const rawData = data as {
+          event_id?: string;
+          message?: { message_id?: string; message_type?: string; content?: string };
+          sender?: { sender_id?: { open_id?: string } };
+        };
+        
+        if (!rawData.message || !rawData.sender) {
           // eslint-disable-next-line no-console
-          console.warn("[feishu-longlink] 事件缺少必要字段，跳过", { messageType, openId });
+          console.warn("[feishu-longlink] 消息数据为空，跳过", { data });
           return;
         }
 
-        await this.messageHandler({
-          message: {
-            content,
-            message_type: messageType,
-          },
-          sender: {
-            sender_id: {
-              open_id: openId,
+        const eventId = rawData.event_id ?? "";
+        const messageType = rawData.message?.message_type ?? "";
+        const content = rawData.message?.content ?? "";
+        const messageId = rawData.message?.message_id ?? "";
+        const openId = rawData.sender?.sender_id?.open_id ?? "";
+
+        if (!openId || !messageType) {
+          // eslint-disable-next-line no-console
+          console.warn("[feishu-longlink] 事件缺少必要字段，跳过", { messageType, openId, content });
+          return;
+        }
+
+        const dedupKey = messageId || eventId;
+        if (dedupKey) {
+          if (isDuplicateMessage(dedupKey)) {
+            // eslint-disable-next-line no-console
+            console.log(`[feishu-longlink] 跳过重复消息（已处理完成）: ${dedupKey}`);
+            return;
+          }
+          if (processingKeys.has(dedupKey)) {
+            // eslint-disable-next-line no-console
+            console.log(`[feishu-longlink] 跳过并发重复消息（处理中）: ${dedupKey}`);
+            return;
+          }
+          // 原子性标记为处理中，防止并发竞态
+          processingKeys.add(dedupKey);
+        }
+
+        try {
+          await this.messageHandler({
+            message: {
+              content,
+              message_type: messageType,
             },
-          },
-        });
+            sender: {
+              sender_id: {
+                open_id: openId,
+              },
+            },
+          });
+          // 只有在成功完成后才标记为已处理
+          if (dedupKey) {
+            markMessageAsProcessed(dedupKey);
+          }
+        } catch (error) {
+          // 处理失败时清除标记，允许重试
+          if (dedupKey) {
+            clearMessageMark(dedupKey);
+          }
+          throw error;
+        } finally {
+          // 处理完成后从进行中集合移除（无论成功还是失败）
+          if (dedupKey) {
+            processingKeys.delete(dedupKey);
+          }
+        }
       },
     });
 
@@ -177,14 +241,31 @@ bot.on("message", async (event: BotMessageEvent) => {
 
     await bot.replyMessage(event, {
       msg_type: "text",
-      content: { text: replyText },
+      content: { text: clampText(replyText, 1600) },
     });
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error("[feishu-longlink] 处理失败:", error);
+
+    if (error instanceof RuntimeCallError && error.code === "opc_unavailable") {
+      await bot.replyMessage(event, {
+        msg_type: "text",
+        content: { text: "请先启动OPC服务（competition_router）后再试。" },
+      });
+      return;
+    }
+
+    if (error instanceof RuntimeCallError) {
+      await bot.replyMessage(event, {
+        msg_type: "text",
+        content: { text: `执行失败：${error.message}` },
+      });
+      return;
+    }
+
     await bot.replyMessage(event, {
       msg_type: "text",
-      content: { text: "服务异常，请稍后再试" },
+      content: { text: `服务异常：${clampText(getErrorMessage(error), 120)}` },
     });
   }
 });
@@ -228,13 +309,123 @@ async function callRuntime(input: string, openId: string): Promise<RuntimeExecut
       signal: controller.signal,
     });
 
-    const payload = await response.json() as RuntimeExecuteResponse;
+    const payload = await parseRuntimeResponse(response);
     if (!response.ok) {
-      throw new Error(`runtime http=${response.status}`);
+      const error = new RuntimeCallError(payload.message ?? `runtime http=${response.status}`);
+      if (typeof payload.error === "string") {
+        error.code = payload.error;
+      }
+      throw error;
+    }
+
+    if (payload.ok === false) {
+      const error = new RuntimeCallError(payload.message ?? "runtime returned ok=false");
+      if (typeof payload.error === "string") {
+        error.code = payload.error;
+      }
+      throw error;
     }
 
     return payload;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function parseRuntimeResponse(response: Response): Promise<RuntimeExecuteResponse> {
+  const rawText = await response.text();
+  if (!rawText) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawText) as RuntimeExecuteResponse;
+  } catch {
+    return {
+      ok: response.ok,
+      message: `runtime 返回非 JSON 响应: ${clampText(rawText, 120)}`,
+    };
+  }
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function clampText(input: string, maxLen: number): string {
+  if (input.length <= maxLen) {
+    return input;
+  }
+  return `${input.slice(0, Math.max(0, maxLen - 1))}…`;
+}
+
+function isDuplicateMessage(messageKey: string): boolean {
+  const now = Date.now();
+
+  for (const [key, timestamp] of processedEventKeys.entries()) {
+    if (now - timestamp > MESSAGE_DEDUP_WINDOW_MS) {
+      processedEventKeys.delete(key);
+    }
+  }
+
+  return processedEventKeys.has(messageKey);
+}
+
+function markMessageAsProcessed(messageKey: string): void {
+  processedEventKeys.set(messageKey, Date.now());
+}
+
+function clearMessageMark(messageKey: string): void {
+  processedEventKeys.delete(messageKey);
+}
+
+function loadDotEnv(): void {
+  // 优先从脚本文件向上查找 .env，确保 PM2 / frp 等 cwd 不同时也能正确加载
+  const candidates = [
+    path.resolve(process.cwd(), ".env"),
+    // modified-runtime/integrations/ -> ../../.. -> openclaw-runtime/
+    path.resolve(__dirname, "..", "..", "..", ".env"),
+    path.resolve(__dirname, ".env"),
+  ];
+
+  let envPath: string | undefined;
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      envPath = candidate;
+      break;
+    }
+  }
+
+  if (!envPath) {
+    console.warn("[feishu-longlink] .env 文件未找到，使用进程环境变量。已搜索路径:", candidates);
+    return;
+  }
+
+  console.log(`[feishu-longlink] 加载 .env: ${envPath}`);
+  const content = fs.readFileSync(envPath, "utf-8");
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const eqIndex = line.indexOf("=");
+    if (eqIndex <= 0) {
+      continue;
+    }
+
+    const key = line.slice(0, eqIndex).trim();
+    let value = line.slice(eqIndex + 1).trim();
+
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    if (!process.env[key]) {
+      process.env[key] = value;
+    }
   }
 }

@@ -11,7 +11,8 @@
     "skill-service": "node skill-service/mock-skill-service.cjs",
     "feishu-gateway": "ts-node modified-runtime/integrations/feishu-gateway.ts",
     "feishu-long": "ts-node modified-runtime/integrations/startup-longlink.ts",
-    "runtime-execute": "ts-node modified-runtime/integrations/runtime-execute-server.ts"
+    "runtime-execute": "ts-node modified-runtime/integrations/runtime-execute-server.ts",
+    "start-local-chain": "npm run skill-service & npm run runtime-execute & npm run feishu-long & wait"
   },
   "keywords": [],
   "author": "",

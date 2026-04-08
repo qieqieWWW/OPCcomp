@@ -85,13 +85,20 @@ export class OpenClawRuntime {
   async execute(brainOutput: RuntimeExecutionInput): Promise<AggregatedRuntimeResult> {
     const taskId = this.resolveTaskId(brainOutput);
     const bossInstruction = this.resolveBossInstruction(brainOutput);
-    this.seedTask(taskId, bossInstruction);
+    console.log(`[OpenClawRuntime] [${taskId}] 开始执行，指令: "${bossInstruction.slice(0, 50)}..."`);
+    this.seedTask(taskId, bossInstruction, brainOutput);
 
     const taskPlan = this.brainAdapter.fromRouterOutput(taskId, bossInstruction, brainOutput);
+    console.log(`[OpenClawRuntime] [${taskId}] taskPlan 创建完成，部门: ${taskPlan.departments?.join(',') || '无'}`);
+    
+    console.log(`[OpenClawRuntime] [${taskId}] 开始 orchestrator.execute()...`);
     const execution = await this.orchestrator.execute(taskPlan, {
       create: (department, planTaskId) => this.createAgent(department, planTaskId),
     });
+    console.log(`[OpenClawRuntime] [${taskId}] orchestrator.execute() 完成，成功: ${execution.report.succeeded.length}, 失败: ${execution.report.failed.length}`);
+    
     const trace = this.monitor.buildTaskTrace(taskId);
+    console.log(`[OpenClawRuntime] [${taskId}] 开始 aggregator.aggregate()...`);
 
     return await this.aggregator.aggregate({
       taskPlan,
@@ -102,15 +109,55 @@ export class OpenClawRuntime {
     });
   }
 
-  private seedTask(taskId: string, bossInstruction: string): void {
+  private seedTask(taskId: string, bossInstruction: string, brainOutput: RuntimeExecutionInput): void {
     if (this.blackboard instanceof InMemoryBlackboard) {
+      const tier = String(brainOutput.small_model?.tier ?? "L2").toUpperCase();
+      const complexity = tier === "L1" ? "simple" : tier === "L3" ? "complex" : "medium";
+      const priority = this.derivePriority(brainOutput, bossInstruction);
+      const routingScore = this.normalizeScore(brainOutput.small_model?.score);
+
       this.blackboard.seedTask({
         taskId,
         bossInstruction,
-        complexity: "medium",
-        priority: 1,
+        complexity,
+        priority,
+        metadata: {
+          routingRating: {
+            tier,
+            score: routingScore,
+            backend: brainOutput.small_model?.backend ?? "unknown",
+            backendReason: brainOutput.small_model?.backend_reason ?? "",
+          },
+        },
       });
     }
+  }
+
+  private derivePriority(brainOutput: RuntimeExecutionInput, bossInstruction: string): number {
+    const score = this.normalizeScore(brainOutput.small_model?.score);
+    const text = bossInstruction.toLowerCase();
+    const urgent = /(紧急|立刻|马上|今天|本周|deadline|urgent|asap)/.test(text);
+
+    if (urgent || score >= 7) {
+      return 3;
+    }
+    if (score >= 4) {
+      return 2;
+    }
+    return 1;
+  }
+
+  private normalizeScore(value: unknown): number {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.max(0, Math.min(10, value));
+    }
+    if (typeof value === "string") {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return Math.max(0, Math.min(10, parsed));
+      }
+    }
+    return 0;
   }
 
   private resolveTaskId(brainOutput: RuntimeExecutionInput): string {

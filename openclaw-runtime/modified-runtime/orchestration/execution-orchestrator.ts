@@ -25,6 +25,7 @@ export class ExecutionOrchestrator {
   async execute(taskPlan: TaskPlan, factory: AgentFactory): Promise<{ outputs: DepartmentOutput[]; report: ExecutionResult }> {
     const startedAt = new Date();
     this.monitor.taskStarted(taskPlan.taskId);
+    console.log(`[ExecutionOrchestrator] [${taskPlan.taskId}] 开始执行任务`);
 
     const approvalDecision = this.evaluateApprovalGate(taskPlan);
     if (approvalDecision.required) {
@@ -60,14 +61,19 @@ export class ExecutionOrchestrator {
     const outputs: DepartmentOutput[] = [];
 
     const executionOrder = this.dependencyManager.getExecutionOrder(taskPlan);
+    console.log(`[ExecutionOrchestrator] [${taskPlan.taskId}] 执行顺序: ${executionOrder.map(batch => `[${batch.join(',')}]`).join(' -> ')}`);
 
     for (const batch of executionOrder) {
+      console.log(`[ExecutionOrchestrator] [${taskPlan.taskId}] 开始批次: ${batch.join(',')}`);
       const agents = batch.map((department) => {
         this.monitor.departmentStarted(taskPlan.taskId, department);
+        console.log(`[ExecutionOrchestrator] [${taskPlan.taskId}] 创建 agent: ${department}`);
         return factory.create(department, taskPlan.taskId);
       });
 
+      console.log(`[ExecutionOrchestrator] [${taskPlan.taskId}] 开始执行批次 agents...`);
       const batchResults = await Promise.allSettled(agents.map((agent) => this.executor.execute(agent)));
+      console.log(`[ExecutionOrchestrator] [${taskPlan.taskId}] 批次执行完成`);
 
       for (const [index, result] of batchResults.entries()) {
         const department = batch[index];
@@ -86,7 +92,14 @@ export class ExecutionOrchestrator {
         this.monitor.departmentFailed(taskPlan.taskId, department, String(result.reason));
       }
 
-      if (failed.length > 0) {
+      // 部分失败时继续执行后续批次，下游 agent 如果强依赖了失败部门，
+      // 会在 preExecuteCheck 返回 false 时抛出 "Dependencies not ready"，由 catch 处理。
+      // 仅当当前批次全部失败 且 历史上没有任何成功 时，提前中止以避免空跑。
+      const batchAllFailed = batch.every((d) => failed.includes(d));
+      if (batchAllFailed && succeeded.length === 0) {
+        console.warn(
+          `[ExecutionOrchestrator] 批次 [${batch.join(",")}] 全部失败且尚无任何成功部门，中止执行。`,
+        );
         break;
       }
     }

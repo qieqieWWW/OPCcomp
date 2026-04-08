@@ -4,6 +4,7 @@ import {
   DepartmentAgentRuntime,
   DepartmentOutput,
 } from "./base-agent";
+import { ensureString, ensureStringArray, requestModelJson } from "./model-json";
 
 interface SalesStrategy {
   pitchAngles: string[];
@@ -32,9 +33,7 @@ export class SalesAgent extends DepartmentAgentRuntime {
 
   async execute(context: AgentContext): Promise<DepartmentOutput> {
     const marketPlan = context.dependencies.market?.output ?? {};
-    const strategy = await this.salesStrategy(marketPlan);
-    const profiles = await this.customerProfiling(marketPlan);
-    const conversion = await this.conversionPlan(strategy);
+    const generated = await this.generateSalesByModel(context.bossInstruction, marketPlan);
 
     return {
       department: "sales",
@@ -42,40 +41,58 @@ export class SalesAgent extends DepartmentAgentRuntime {
       status: "completed",
       score: 86,
       output: {
-        strategy,
-        profiles,
-        conversion,
+        strategy: generated.strategy,
+        profiles: generated.profiles,
+        conversion: generated.conversion,
       },
       timestamp: new Date(),
       metadata: {
         dependencies: this.getDependencies(),
+        generationMode: "model-driven",
       },
     };
   }
 
-  private async salesStrategy(marketPlan: Record<string, unknown>): Promise<SalesStrategy> {
-    const hasMarket = Object.keys(marketPlan).length > 0;
-    return {
-      pitchAngles: hasMarket
-        ? ["ROI可量化", "部署快", "降低人力成本"]
-        : ["快速试点", "低风险接入"],
-      pricingGuide: "基础版按席位，高级版按流程包年",
-    };
-  }
+  private async generateSalesByModel(
+    bossInstruction: string,
+    marketData: Record<string, unknown>,
+  ): Promise<{ strategy: SalesStrategy; profiles: CustomerProfiles; conversion: ConversionPlan }> {
+    const systemPrompt = [
+      "你是销售策略顾问。",
+      "请基于老板任务与 market 输出生成 sales 部门 JSON。",
+      "仅返回 JSON，不要输出解释文字。",
+      "JSON 结构:",
+      "{",
+      "  \"strategy\": { \"pitchAngles\": string[], \"pricingGuide\": string },",
+      "  \"profiles\": { \"primary\": string, \"secondary\": string[] },",
+      "  \"conversion\": { \"stages\": string[], \"followUpSla\": string, \"closingSignals\": string[] }",
+      "}",
+    ].join("\n");
 
-  private async customerProfiling(targetAudience: Record<string, unknown>): Promise<CustomerProfiles> {
-    const prefix = Object.keys(targetAudience).length > 0 ? "来自市场画像" : "默认画像";
-    return {
-      primary: `${prefix}-10~50人团队创业公司`,
-      secondary: ["传统企业数字化部门", "咨询与代运营团队"],
-    };
-  }
+    const userPrompt = [
+      `老板任务: ${bossInstruction}`,
+      `market 输出(JSON): ${JSON.stringify(marketData).slice(0, 6000)}`,
+    ].join("\n\n");
 
-  private async conversionPlan(strategy: SalesStrategy): Promise<ConversionPlan> {
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const strategyRaw = (raw.strategy && typeof raw.strategy === "object") ? raw.strategy as Record<string, unknown> : {};
+    const profilesRaw = (raw.profiles && typeof raw.profiles === "object") ? raw.profiles as Record<string, unknown> : {};
+    const conversionRaw = (raw.conversion && typeof raw.conversion === "object") ? raw.conversion as Record<string, unknown> : {};
+
     return {
-      stages: ["线索筛选", "需求访谈", "试点提案", `商务签约(${strategy.pricingGuide})`],
-      followUpSla: "24小时内首次触达，72小时内二次跟进",
-      closingSignals: ["明确预算", "明确决策人", "愿意试点"],
+      strategy: {
+        pitchAngles: ensureStringArray(strategyRaw.pitchAngles, ["待模型补全"]),
+        pricingGuide: ensureString(strategyRaw.pricingGuide, "待模型补全"),
+      },
+      profiles: {
+        primary: ensureString(profilesRaw.primary, "待模型补全"),
+        secondary: ensureStringArray(profilesRaw.secondary, ["待模型补全"]),
+      },
+      conversion: {
+        stages: ensureStringArray(conversionRaw.stages, ["待模型补全"]),
+        followUpSla: ensureString(conversionRaw.followUpSla, "待模型补全"),
+        closingSignals: ensureStringArray(conversionRaw.closingSignals, ["待模型补全"]),
+      },
     };
   }
 }

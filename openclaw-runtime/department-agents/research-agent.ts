@@ -5,6 +5,7 @@ import {
   DepartmentOutput,
 } from "./base-agent";
 import { SkillInvoker } from "../modified-runtime/tools/skill-invoker";
+import { ensureString, ensureStringArray, requestModelJson } from "./model-json";
 
 interface PatentAnalysis {
   technicalSummary: string;
@@ -42,6 +43,14 @@ interface WebResearchSummary {
   reason?: string;
 }
 
+interface WebResearchDecision {
+  needWebSearch: boolean;
+  query: string;
+  reason: string;
+}
+
+type WebSearchProvider = "tavily" | "serper" | "none";
+
 function readEnv(name: string): string | undefined {
   const maybeProcess = globalThis as { process?: { env?: Record<string, string | undefined> } };
   return maybeProcess.process?.env?.[name];
@@ -58,7 +67,8 @@ export class ResearchAgent extends DepartmentAgentRuntime {
 
   async execute(context: AgentContext): Promise<DepartmentOutput> {
     const patent = await this.parsePatent(context.bossInstruction);
-    const webResearch = await this.searchAndSummarizeWeb(context.bossInstruction);
+    const decision = await this.decideWebResearch(context.bossInstruction);
+    const webResearch = await this.searchAndSummarizeWeb(context.bossInstruction, decision);
     const feasibility = await this.assessFeasibility(patent);
     const report = await this.generateReport({
       patent,
@@ -83,19 +93,68 @@ export class ResearchAgent extends DepartmentAgentRuntime {
         dependencyCount: 0,
         webResearchStatus: webResearch.status,
         webResearchProvider: webResearch.provider,
+        webResearchDecision: decision.reason,
       },
     };
   }
 
-  private async searchAndSummarizeWeb(instruction: string): Promise<WebResearchSummary> {
-    const query = this.extractSearchQuery(instruction);
-    const serviceUrl = readEnv("OPENCLAW_SKILL_SERVICE_URL") ?? readEnv("OPENCLOW_SKILL_SERVICE_URL") ?? "";
-    if (serviceUrl.trim().length === 0) {
+  private async decideWebResearch(instruction: string): Promise<WebResearchDecision> {
+    const force = (readEnv("RESEARCH_FORCE_WEB_SEARCH") ?? "").toLowerCase();
+    if (force === "true") {
+      return {
+        needWebSearch: true,
+        query: this.extractSearchQuery(instruction),
+        reason: "forced_by_env",
+      };
+    }
+
+    const systemPrompt = [
+      "你是 research 工具调度器。",
+      "判断当前任务是否必须做网页检索（browser skill）。",
+      "仅返回 JSON，结构为 {\"needWebSearch\": boolean, \"query\": string, \"reason\": string}。",
+      "只有在任务明确要求最新动态、竞品信息、外部事实核验时，needWebSearch 才为 true。",
+    ].join("\n");
+    const userPrompt = `任务描述: ${instruction}`;
+
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const needWebSearch = raw.needWebSearch === true;
+    return {
+      needWebSearch,
+      query: ensureString(raw.query, this.extractSearchQuery(instruction)),
+      reason: ensureString(raw.reason, needWebSearch ? "model_required" : "model_not_required"),
+    };
+  }
+
+  private async searchAndSummarizeWeb(
+    instruction: string,
+    decision: WebResearchDecision,
+  ): Promise<WebResearchSummary> {
+    const query = decision.query || this.extractSearchQuery(instruction);
+    if (!decision.needWebSearch) {
       return {
         provider: "baidu",
         query,
         hits: [],
-        summary: `未配置技能服务，返回本地摘要占位。建议配置 OPENCLAW_SKILL_SERVICE_URL 后重试，关键词：${query}`,
+        summary: "本次任务未触发网页检索，已直接基于任务输入与内部上下文进行研究分析。",
+        status: "fallback",
+        reason: decision.reason,
+      };
+    }
+
+    const apiSearchResult = await this.searchViaWebApi(query);
+    if (apiSearchResult) {
+      return apiSearchResult;
+    }
+
+    console.log(`[ResearchAgent] [${this.taskId}] 开始网页检索回退（browser skill），关键词: "${query}"`);
+    const serviceUrl = readEnv("OPENCLAW_SKILL_SERVICE_URL") ?? readEnv("OPENCLOW_SKILL_SERVICE_URL") ?? "";
+    if (serviceUrl.trim().length === 0) {
+      console.log(`[ResearchAgent] [${this.taskId}] OPENCLAW_SKILL_SERVICE_URL 未配置，使用 fallback`);
+      return {
+        provider: "baidu",
+        query,
+        hits: [],
+        summary: `外部实时检索当前不可用，本轮先基于可用上下文完成初步分析。待数据通道恢复后补充最新市场证据。关键词：${query}`,
         status: "fallback",
         reason: "missing_skill_service_url",
       };
@@ -107,15 +166,22 @@ export class ResearchAgent extends DepartmentAgentRuntime {
     );
 
     try {
-      const browserOutput = await invoker.invoke("browser-automation", {
-        start_url: (readEnv("BAIDU_WEB_URL") ?? "https://www.baidu.com").trim(),
-        actions: this.buildBaiduActions(query),
-        options: {
-          provider: "baidu",
-          query,
-          top_k: this.readTopK(),
-        },
-      });
+      console.log(`[ResearchAgent] [${this.taskId}] 调用 skill-service: ${serviceUrl}/skills/invoke`);
+      // 添加超时机制，避免 skill-service 卡住
+      const browserOutput = await Promise.race([
+        invoker.invoke("browser-automation", {
+          start_url: (readEnv("BAIDU_WEB_URL") ?? "https://www.baidu.com").trim(),
+          actions: this.buildBaiduActions(query),
+          options: {
+            provider: "baidu",
+            query,
+            top_k: this.readTopK(),
+          },
+        }),
+        new Promise<never>((_, reject) => 
+          setTimeout(() => reject(new Error("skill-service 调用超时 (10秒)")), 10000)
+        ),
+      ]);
 
       const hits = this.extractHits(browserOutput).slice(0, this.readTopK());
       const summary = this.buildSummaryFromHits(query, hits, browserOutput);
@@ -132,7 +198,7 @@ export class ResearchAgent extends DepartmentAgentRuntime {
         provider: "baidu",
         query,
         hits: [],
-        summary: `百度检索执行失败，已降级为本地摘要占位。关键词：${query}`,
+        summary: `外部实时检索当前不可用，本轮先基于可用上下文完成初步分析。待数据通道恢复后补充最新市场证据。关键词：${query}`,
         status: "fallback",
         reason: String(error),
       };
@@ -202,6 +268,144 @@ export class ResearchAgent extends DepartmentAgentRuntime {
     return Math.min(10, Math.max(1, Math.floor(parsed)));
   }
 
+  private readWebSearchProvider(): WebSearchProvider {
+    const explicit = (readEnv("WEB_SEARCH_PROVIDER") ?? "").trim().toLowerCase();
+    if (explicit === "tavily" || explicit === "serper") {
+      return explicit;
+    }
+    return "none";
+  }
+
+  private readWebSearchTimeoutMs(): number {
+    const raw = Number(readEnv("WEB_SEARCH_TIMEOUT_MS") ?? "10000");
+    if (!Number.isFinite(raw)) {
+      return 10000;
+    }
+    return Math.min(30000, Math.max(3000, Math.floor(raw)));
+  }
+
+  private async searchViaWebApi(query: string): Promise<WebResearchSummary | null> {
+    const provider = this.readWebSearchProvider();
+    if (provider === "none") {
+      return null;
+    }
+
+    const timeoutMs = this.readWebSearchTimeoutMs();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      let hits: WebSearchHit[] = [];
+      if (provider === "tavily") {
+        hits = await this.searchViaTavily(query, controller.signal);
+      } else if (provider === "serper") {
+        hits = await this.searchViaSerper(query, controller.signal);
+      }
+
+      if (hits.length === 0) {
+        return null;
+      }
+
+      return {
+        provider,
+        query,
+        hits,
+        summary: this.buildSummaryFromHits(query, hits, { provider, source: "web_search_api" }),
+        status: "completed",
+      };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async searchViaTavily(query: string, signal: AbortSignal): Promise<WebSearchHit[]> {
+    const apiKey = (readEnv("TAVILY_API_KEY") ?? "").trim();
+    if (!apiKey) {
+      return [];
+    }
+
+    const response = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query,
+        max_results: this.readTopK(),
+      }),
+      signal,
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const payload = await response.json() as { results?: Array<Record<string, unknown>> };
+    const results = Array.isArray(payload.results) ? payload.results : [];
+    return results
+      .map((row) => {
+        const title = this.readString(row, ["title"]) ?? "未命名结果";
+        const url = this.readString(row, ["url"]) ?? "";
+        const snippet = this.readString(row, ["content", "snippet"]);
+        if (!url) {
+          return null;
+        }
+        return {
+          title,
+          url,
+          ...(snippet ? { snippet } : {}),
+        };
+      })
+      .filter((item): item is WebSearchHit => item !== null)
+      .slice(0, this.readTopK());
+  }
+
+  private async searchViaSerper(query: string, signal: AbortSignal): Promise<WebSearchHit[]> {
+    const apiKey = (readEnv("SERPER_API_KEY") ?? "").trim();
+    if (!apiKey) {
+      return [];
+    }
+
+    const response = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-API-KEY": apiKey,
+      },
+      body: JSON.stringify({
+        q: query,
+        num: this.readTopK(),
+      }),
+      signal,
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const payload = await response.json() as { organic?: Array<Record<string, unknown>> };
+    const organic = Array.isArray(payload.organic) ? payload.organic : [];
+    return organic
+      .map((row) => {
+        const title = this.readString(row, ["title"]) ?? "未命名结果";
+        const url = this.readString(row, ["link", "url"]) ?? "";
+        const snippet = this.readString(row, ["snippet"]);
+        if (!url) {
+          return null;
+        }
+        return {
+          title,
+          url,
+          ...(snippet ? { snippet } : {}),
+        };
+      })
+      .filter((item): item is WebSearchHit => item !== null)
+      .slice(0, this.readTopK());
+  }
+
   private extractHits(browserOutput: Record<string, unknown>): WebSearchHit[] {
     const candidateKeys = ["hits", "results", "items", "pages", "links"];
 
@@ -243,6 +447,11 @@ export class ResearchAgent extends DepartmentAgentRuntime {
   }
 
   private buildSummaryFromHits(query: string, hits: WebSearchHit[], raw: Record<string, unknown>): string {
+    const provider = this.readString(raw, ["provider"]) ?? "web";
+    const providerLabel = provider === "tavily" || provider === "serper"
+      ? `${provider} 网页检索`
+      : "网页检索";
+
     if (hits.length === 0) {
       const fallback = this.readString(raw, ["summary", "result_summary", "message"]);
       if (fallback) {
@@ -256,7 +465,7 @@ export class ResearchAgent extends DepartmentAgentRuntime {
       return `${index + 1}. ${hit.title}${detail}`;
     });
 
-    return `关键词“${query}”百度检索命中 ${hits.length} 条，核心结论：${lines.join(" ")}`;
+    return `关键词“${query}”${providerLabel}命中 ${hits.length} 条，核心结论：${lines.join(" ")}`;
   }
 
   private readString(container: Record<string, unknown>, keys: string[]): string | null {
@@ -283,7 +492,7 @@ export class ResearchAgent extends DepartmentAgentRuntime {
     return {
       score: 82,
       technicalFeasibility: 84,
-      resourceRequirements: ["2名工程师", "1名产品经理", "GPU推理环境"],
+      resourceRequirements: ["2名工程师", "1名产品经理", "托管API方案"],
       timelineEstimate: `${techInfo.keyTechnologies.length + 3}周`,
     };
   }
@@ -294,11 +503,36 @@ export class ResearchAgent extends DepartmentAgentRuntime {
     taskInfo: AgentContext["taskInfo"];
     webResearch: WebResearchSummary;
   }): Promise<ResearchReport> {
+    const systemPrompt = [
+      "你是 research 部门分析师。",
+      "请根据输入信息生成 research.report 的 JSON。",
+      "仅返回 JSON 对象，禁止输出额外说明。",
+      "若外部检索不可用，不要暴露工具错误细节（如检索失败/超时/接口错误），统一表述为\"外部实时数据待补充\"并继续分析。",
+      "优先给出业务与投资可执行建议；除非用户明确要求系统架构设计，否则不要主动推荐 GPU 集群、小模型路由、自建推理环境。",
+      "结构:",
+      "{",
+      "  \"executiveSummary\": string,",
+      "  \"detailedAnalysis\": string,",
+      "  \"recommendations\": string[],",
+      "  \"nextSteps\": string[]",
+      "}",
+    ].join("\n");
+
+    const userPrompt = [
+      `webResearch.summary: ${data.webResearch.summary}`,
+      `feasibility.score: ${data.feasibility.score}`,
+      `feasibility.timelineEstimate: ${data.feasibility.timelineEstimate}`,
+      `taskInfo.complexity: ${data.taskInfo.complexity}`,
+      `patent(JSON): ${JSON.stringify(data.patent).slice(0, 2500)}`,
+      `webResearch(JSON): ${JSON.stringify(data.webResearch).slice(0, 2500)}`,
+    ].join("\n");
+
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
     return {
-      executiveSummary: `${data.webResearch.summary}。技术方案具备落地条件，建议进入原型开发阶段。`,
-      detailedAnalysis: `复杂度=${data.taskInfo.complexity}，可行性评分=${data.feasibility.score}，检索状态=${data.webResearch.status}`,
-      recommendations: ["优先实现核心能力", "并行建设评估指标", "将检索关键词固化为任务参数"],
-      nextSteps: ["输出PoC计划", "定义验收标准", "验证百度检索动作在真实页面稳定性"],
+      executiveSummary: ensureString(raw.executiveSummary, `${data.webResearch.summary}。`),
+      detailedAnalysis: ensureString(raw.detailedAnalysis, `复杂度=${data.taskInfo.complexity}，可行性评分=${data.feasibility.score}`),
+      recommendations: ensureStringArray(raw.recommendations, ["待模型补全"]),
+      nextSteps: ensureStringArray(raw.nextSteps, ["待模型补全"]),
     };
   }
 }

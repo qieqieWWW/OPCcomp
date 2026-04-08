@@ -25,6 +25,13 @@ interface FeishuEventBody {
   };
 }
 
+class SmallTalkModelError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SmallTalkModelError";
+  }
+}
+
 function readEnv(name: string): string | undefined {
   const maybeProcess = globalThis as { process?: { env?: Record<string, string | undefined> } };
   return maybeProcess.process?.env?.[name];
@@ -34,6 +41,11 @@ const FEISHU_APP_ID = readEnv("FEISHU_APP_ID") ?? "";
 const FEISHU_APP_SECRET = readEnv("FEISHU_APP_SECRET") ?? "";
 const FEISHU_GATEWAY_HOST = readEnv("FEISHU_GATEWAY_HOST") ?? "0.0.0.0";
 const FEISHU_GATEWAY_PORT = Number(readEnv("FEISHU_GATEWAY_PORT") ?? "9090");
+const SMALL_TALK_MODEL_CHAT_URL = readEnv("SMALL_TALK_MODEL_CHAT_URL")
+  ?? buildChatUrl(readEnv("SMALL_TALK_MODEL_BASE_URL") ?? readEnv("AGENT_LLM_BASE_URL") ?? "http://127.0.0.1:8080/apis/ais-v2");
+const SMALL_TALK_MODEL_NAME = readEnv("SMALL_TALK_MODEL_NAME") ?? readEnv("AGENT_LLM_MODEL") ?? "qwen3-1.7b-instruct";
+const SMALL_TALK_MODEL_API_KEY = readEnv("SMALL_TALK_MODEL_API_KEY") ?? readEnv("AGENT_LLM_API_KEY") ?? "";
+const SMALL_TALK_MODEL_TIMEOUT_MS = Number(readEnv("SMALL_TALK_MODEL_TIMEOUT_MS") ?? "12000");
 
 if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
   // eslint-disable-next-line no-console
@@ -104,6 +116,20 @@ const server = http.createServer(async (req: http.IncomingMessage, res: http.Ser
         await sendFeishuTextMessage(senderOpenId, "未识别到有效文本指令，请直接输入任务描述。");
         sendJson(res, 200, { ok: true, ignored: "empty_instruction" });
         return;
+      }
+
+      if (isCasualChat(instruction)) {
+        try {
+          const reply = await generateCasualReplyBySmallModel(instruction);
+          await sendFeishuTextMessage(senderOpenId, reply);
+          sendJson(res, 200, { ok: true, mode: "small_talk" });
+          return;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await sendFeishuTextMessage(senderOpenId, `闲聊回复失败：${message}`);
+          sendJson(res, 502, { ok: false, error: "small_talk_model_error", message });
+          return;
+        }
       }
 
       const taskId = `feishu-${Date.now()}-${randomUUID().slice(0, 8)}`;
@@ -213,26 +239,185 @@ function buildDefaultEdges(experts: Array<{ name: string }>): Array<{ from: stri
 }
 
 function buildReplyText(result: {
+  bossInstruction?: string;
   taskId: string;
-  executiveSummary: { headline: string; overview: string; nextStep: string; warnings: string[] };
+  executiveSummary: {
+    headline: string;
+    overview: string;
+    nextStep: string;
+    warnings: string[];
+    highlights?: string[];
+    businessValue?: string;
+    riskView?: string;
+    priorityOrder?: string[];
+    qualityScore?: number;
+    feasibilityScore?: number;
+    feasibilityVerdict?: string;
+    businessValueRating?: string;
+    riskLevel?: string;
+  };
   succeeded: string[];
   failed: string[];
   qualityAssessment: { overallScore: number; overallGrade: string };
+  fusedResult?: {
+    type?: string;
+    fusedContent?: string;
+    confidence?: number;
+    fusionMethod?: string;
+    rankedCandidates?: Array<{
+      department?: string;
+      totalScore?: number;
+      content?: string;
+    }>;
+  } | null;
 }): string {
-  const warnings = result.executiveSummary.warnings.length > 0
-    ? `风险提示: ${result.executiveSummary.warnings.join("；")}`
-    : "风险提示: 无";
+  const summary = result.executiveSummary;
+  const overview = trimTrailingPunctuation(summary?.overview ?? "");
+  const nextStep = trimTrailingPunctuation(summary?.nextStep ?? "");
+  const warnings = (summary?.warnings ?? []).filter((item) => typeof item === "string" && item.trim().length > 0);
+  const fused = normalizeFusionText(result.fusedResult?.fusedContent);
+  const topRankedContent = normalizeFusionText(result.fusedResult?.rankedCandidates?.[0]?.content);
 
-  return [
-    `任务ID: ${result.taskId}`,
-    `结论: ${result.executiveSummary.headline}`,
-    `概览: ${result.executiveSummary.overview}`,
-    `建议下一步: ${result.executiveSummary.nextStep}`,
-    `成功部门: ${result.succeeded.join(",") || "无"}`,
-    `失败部门: ${result.failed.join(",") || "无"}`,
-    `质量评分: ${result.qualityAssessment.overallScore} (${result.qualityAssessment.overallGrade})`,
-    warnings,
-  ].join("\n");
+  const lines: string[] = [];
+  if (fused) {
+    lines.push(fused);
+  } else if (topRankedContent) {
+    lines.push(topRankedContent);
+  } else {
+    lines.push(overview || `任务 ${result.taskId} 已完成执行。`);
+  }
+
+  lines.push(`执行结果：成功 ${result.succeeded.length} 个部门，失败 ${result.failed.length} 个。`);
+
+  if (nextStep) {
+    lines.push(`下一步建议：${nextStep}。`);
+  }
+
+  if (warnings.length > 0) {
+    lines.push(`风险提示：${warnings.join("；")}。`);
+  }
+
+  return lines.join("\n");
+}
+
+function trimTrailingPunctuation(text: string): string {
+  return text.trim().replace(/[。.!！?？\s]+$/g, "");
+}
+
+function normalizeFusionText(text: string | undefined): string {
+  if (!text) {
+    return "";
+  }
+
+  const lines = text
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .filter((line) => !/^融合结果（本地回退）/.test(line))
+    .filter((line) => !/^架构：/.test(line))
+    .filter((line) => !/^策略：/.test(line))
+    .filter((line) => !/^提示：/.test(line))
+    .filter((line) => !/^顶部候选：/.test(line))
+    .filter((line) => !/^##\s*\d+\./.test(line))
+    .filter((line) => !/^-\s*(total|base|pair|wins):/i.test(line));
+
+  return lines
+    .join("\n")
+    .replace(/百度检索执行失败|检索失败|调用超时|接口错误/g, "外部实时数据待补充")
+    .replace(/待模型补全/g, "待补充")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function isCasualChat(input: string): boolean {
+  const text = input.trim().toLowerCase();
+  if (!text) {
+    return false;
+  }
+
+  return /^(你好|您好|hi|hello|hey|在吗|在不在|哈喽|嗨|早上好|中午好|下午好|晚上好|yo|你能干什么|你会什么|你可以做什么|介绍下你自己|你是谁|help|帮助)[!！,.，。\s?？]*$/.test(text);
+}
+
+async function generateCasualReplyBySmallModel(input: string): Promise<string> {
+  const timeoutMs = Number.isFinite(SMALL_TALK_MODEL_TIMEOUT_MS) && SMALL_TALK_MODEL_TIMEOUT_MS > 0
+    ? SMALL_TALK_MODEL_TIMEOUT_MS
+    : 12000;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json; charset=utf-8",
+    };
+    if (SMALL_TALK_MODEL_API_KEY.trim().length > 0) {
+      headers.Authorization = `Bearer ${SMALL_TALK_MODEL_API_KEY.trim()}`;
+    }
+
+    const response = await fetch(SMALL_TALK_MODEL_CHAT_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: SMALL_TALK_MODEL_NAME,
+        temperature: 0.7,
+        messages: [
+          {
+            role: "system",
+            content: "你是创业执行框架里的轻量助手。面对寒暄和功能咨询，使用自然、简短、有人味的中文回复。不要输出JSON，不要模板腔，不要提及内部路由/部门。",
+          },
+          {
+            role: "user",
+            content: input,
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new SmallTalkModelError(`闲聊小模型调用失败: http=${response.status}, body=${body.slice(0, 200)}`);
+    }
+
+    const payload = await response.json() as {
+      choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
+    };
+    const content = payload.choices?.[0]?.message?.content;
+
+    if (typeof content === "string" && content.trim().length > 0) {
+      return content.trim();
+    }
+
+    if (Array.isArray(content)) {
+      const text = content
+        .map((part) => (part && typeof part === "object" && part.type === "text" ? part.text ?? "" : ""))
+        .join("\n")
+        .trim();
+      if (text.length > 0) {
+        return text;
+      }
+    }
+
+    throw new SmallTalkModelError("闲聊小模型返回为空，无法生成回复。");
+  } catch (error) {
+    if (error instanceof SmallTalkModelError) {
+      throw error;
+    }
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new SmallTalkModelError(`闲聊小模型响应超时（>${timeoutMs}ms）。`);
+    }
+    throw new SmallTalkModelError(`闲聊小模型异常: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildChatUrl(baseUrl: string): string {
+  const normalized = baseUrl.replace(/\/$/, "");
+  if (normalized.endsWith("/chat/completions")) {
+    return normalized;
+  }
+  return `${normalized}/chat/completions`;
 }
 
 async function sendFeishuTextMessage(receiverOpenId: string, text: string): Promise<void> {

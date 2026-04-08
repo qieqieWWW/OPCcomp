@@ -87,3 +87,29 @@ PYTHONPATH=OPCcomp/competition_router/src python OPCcomp/competition_router/exam
 说明：
 - 若不传 `--api-key` 且服务开启鉴权，会返回 401。
 - 当前实现先输出本地路由与融合结果，再可选调用远程服务做二次摘要。
+
+## 启动 OPC 路由服务（供 openclaw-runtime 调用）
+当你要跑「飞书 -> runtime -> 小模型路由 -> 多 agent 执行 -> 飞书回复」真实链路时，需要启动这个服务：
+
+```bash
+PYTHONPATH=OPCcomp/competition_router/src python OPCcomp/competition_router/examples/opc_service.py --host 0.0.0.0 --port 18080
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:18080/health
+```
+
+路由接口：
+- `POST /route`
+- 入参：`{"input":"用户任务文本","try_remote_llm":true}`
+- 返回：`small_model / selected_experts / collaboration_plan / info_pool_hits / output_attribution / runtime_trace`
+
+## 真实全链路最小启动顺序
+1. 启动 OPC 路由服务（本目录 `examples/opc_service.py`）。
+2. 在 `OPCcomp/openclaw-runtime` 启动技能服务：`npm run skill-service`。
+3. 启动 runtime execute：`npm run runtime-execute`。
+4. 启动飞书长连接：`npm run feishu-long`。
+
+如果 OPC 路由服务未启动，飞书会收到提示：`请先启动OPC服务（competition_router）后再试。`

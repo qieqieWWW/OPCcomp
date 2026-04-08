@@ -4,6 +4,7 @@ import {
   DepartmentAgentRuntime,
   DepartmentOutput,
 } from "./base-agent";
+import { ensureString, ensureStringArray, requestModelJson } from "./model-json";
 
 interface MarketAnalysis {
   marketSize: string;
@@ -34,9 +35,7 @@ export class StrategyAgent extends DepartmentAgentRuntime {
 
   async execute(context: AgentContext): Promise<DepartmentOutput> {
     const researchData = context.dependencies.research?.output ?? {};
-    const market = await this.marketAnalysis(researchData);
-    const businessModel = await this.designBusinessModel(market);
-    const strategy = await this.competitorStrategy({ market, businessModel });
+    const generated = await this.generateStrategyByModel(context.bossInstruction, researchData);
 
     return {
       department: "strategy",
@@ -44,45 +43,63 @@ export class StrategyAgent extends DepartmentAgentRuntime {
       status: "completed",
       score: 80,
       output: {
-        market,
-        businessModel,
-        strategy,
+        market: generated.market,
+        businessModel: generated.businessModel,
+        strategy: generated.strategy,
       },
       timestamp: new Date(),
       metadata: {
         basedOn: ["research"],
+        generationMode: "model-driven",
       },
     };
   }
 
-  private async marketAnalysis(researchData: Record<string, unknown>): Promise<MarketAnalysis> {
-    const hint = Object.keys(researchData).length > 0 ? "结合研发输出" : "基于老板输入";
-    return {
-      marketSize: "约120亿/年",
-      growthRate: "18%",
-      keySegments: [hint, "企业服务", "自动化运营"],
-    };
-  }
+  private async generateStrategyByModel(
+    bossInstruction: string,
+    researchData: Record<string, unknown>,
+  ): Promise<{ market: MarketAnalysis; businessModel: BusinessModel; strategy: StrategyPlan }> {
+    const systemPrompt = [
+      "你是创业项目战略顾问。",
+      "请基于用户任务与 research 部门输出，生成策略部门 JSON。",
+      "禁止返回解释性文字，只返回 JSON 对象。",
+      "JSON 结构必须是:",
+      "{",
+      "  \"market\": { \"marketSize\": string, \"growthRate\": string, \"keySegments\": string[] },",
+      "  \"businessModel\": { \"valueProposition\": string, \"revenueModel\": string, \"costStructure\": string[] },",
+      "  \"strategy\": { \"positioning\": string, \"moat\": string[], \"actionPlan\": string[] }",
+      "}",
+      "actionPlan 至少 3 条，且与当前任务场景强相关，不要套模板。",
+      "强调成本与落地：优先 API/托管/轻量方案，避免无依据的大规模基础设施建议。",
+      "除非用户明确要求架构设计，否则不要主动给出 GPU 集群、小模型路由、自建推理环境等建议。",
+    ].join("\n");
 
-  private async designBusinessModel(marketData: MarketAnalysis): Promise<BusinessModel> {
-    return {
-      valueProposition: "用低成本AI团队替代高频重复岗位工作",
-      revenueModel: "订阅制 + 增值服务",
-      costStructure: ["模型推理", "数据采集", `市场投放(${marketData.growthRate})`],
-    };
-  }
+    const userPrompt = [
+      `老板任务: ${bossInstruction}`,
+      `research 输出(JSON): ${JSON.stringify(researchData).slice(0, 6000)}`,
+    ].join("\n\n");
 
-  private async competitorStrategy(analysis: {
-    market: MarketAnalysis;
-    businessModel: BusinessModel;
-  }): Promise<StrategyPlan> {
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const marketRaw = (raw.market && typeof raw.market === "object") ? raw.market as Record<string, unknown> : {};
+    const modelRaw = (raw.businessModel && typeof raw.businessModel === "object") ? raw.businessModel as Record<string, unknown> : {};
+    const strategyRaw = (raw.strategy && typeof raw.strategy === "object") ? raw.strategy as Record<string, unknown> : {};
+
     return {
-      positioning: "中小企业一站式AI运营中台",
-      moat: ["部门协同流程资产", "行业模板沉淀"],
-      actionPlan: [
-        `优先攻击增长率${analysis.market.growthRate}的子市场`,
-        `围绕${analysis.businessModel.revenueModel}优化定价`,
-      ],
+      market: {
+        marketSize: ensureString(marketRaw.marketSize, "待模型补全"),
+        growthRate: ensureString(marketRaw.growthRate, "待模型补全"),
+        keySegments: ensureStringArray(marketRaw.keySegments, ["待模型补全"]),
+      },
+      businessModel: {
+        valueProposition: ensureString(modelRaw.valueProposition, "待模型补全"),
+        revenueModel: ensureString(modelRaw.revenueModel, "待模型补全"),
+        costStructure: ensureStringArray(modelRaw.costStructure, ["待模型补全"]),
+      },
+      strategy: {
+        positioning: ensureString(strategyRaw.positioning, "待模型补全"),
+        moat: ensureStringArray(strategyRaw.moat, ["待模型补全"]),
+        actionPlan: ensureStringArray(strategyRaw.actionPlan, ["待模型补全"]),
+      },
     };
   }
 }

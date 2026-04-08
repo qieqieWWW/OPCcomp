@@ -4,6 +4,7 @@ import {
   DepartmentAgentRuntime,
   DepartmentOutput,
 } from "./base-agent";
+import { ensureStringArray, requestModelJson } from "./model-json";
 
 interface LegalRisks {
   high: string[];
@@ -32,9 +33,7 @@ export class LegalAgent extends DepartmentAgentRuntime {
 
   async execute(context: AgentContext): Promise<DepartmentOutput> {
     const techData = context.dependencies.research?.output ?? {};
-    const risks = await this.riskAssessment(techData);
-    const compliance = await this.complianceCheck(techData);
-    const ip = await this.ipProtectionStrategy(techData);
+    const generated = await this.generateLegalByModel(context.bossInstruction, techData);
 
     return {
       department: "legal",
@@ -42,37 +41,58 @@ export class LegalAgent extends DepartmentAgentRuntime {
       status: "completed",
       score: 78,
       output: {
-        risks,
-        compliance,
-        ip,
+        risks: generated.risks,
+        compliance: generated.compliance,
+        ip: generated.ip,
       },
       timestamp: new Date(),
       metadata: {
         reviewedDependencies: this.getDependencies(),
+        generationMode: "model-driven",
       },
     };
   }
 
-  private async riskAssessment(techData: Record<string, unknown>): Promise<LegalRisks> {
-    const hasData = Object.keys(techData).length > 0;
-    return {
-      high: hasData ? ["数据合规边界不清"] : ["需求信息不足"],
-      medium: ["跨境数据传输条款待补齐"],
-      low: ["商标注册流程可并行推进"],
-    };
-  }
+  private async generateLegalByModel(
+    bossInstruction: string,
+    researchData: Record<string, unknown>,
+  ): Promise<{ risks: LegalRisks; compliance: ComplianceIssues; ip: IPStrategy }> {
+    const systemPrompt = [
+      "你是法律合规顾问。",
+      "请基于任务与 research 输出，给出 legal 部门 JSON。",
+      "仅返回 JSON，不要附加说明。",
+      "JSON 结构:",
+      "{",
+      "  \"risks\": { \"high\": string[], \"medium\": string[], \"low\": string[] },",
+      "  \"compliance\": { \"findings\": string[], \"remediation\": string[] },",
+      "  \"ip\": { \"filingPlan\": string[], \"watchList\": string[] }",
+      "}",
+    ].join("\n");
 
-  private async complianceCheck(_businessPlan: Record<string, unknown>): Promise<ComplianceIssues> {
-    return {
-      findings: ["需要补充用户授权记录", "日志留存周期需定义"],
-      remediation: ["补充隐私协议", "建立审计日志策略"],
-    };
-  }
+    const userPrompt = [
+      `老板任务: ${bossInstruction}`,
+      `research 输出(JSON): ${JSON.stringify(researchData).slice(0, 6000)}`,
+    ].join("\n\n");
 
-  private async ipProtectionStrategy(_patentInfo: Record<string, unknown>): Promise<IPStrategy> {
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const risksRaw = (raw.risks && typeof raw.risks === "object") ? raw.risks as Record<string, unknown> : {};
+    const complianceRaw = (raw.compliance && typeof raw.compliance === "object") ? raw.compliance as Record<string, unknown> : {};
+    const ipRaw = (raw.ip && typeof raw.ip === "object") ? raw.ip as Record<string, unknown> : {};
+
     return {
-      filingPlan: ["核心算法发明专利", "产品品牌商标"],
-      watchList: ["相似技术公开数据库", "竞品专利布局"],
+      risks: {
+        high: ensureStringArray(risksRaw.high, ["待模型补全"]),
+        medium: ensureStringArray(risksRaw.medium, ["待模型补全"]),
+        low: ensureStringArray(risksRaw.low, ["待模型补全"]),
+      },
+      compliance: {
+        findings: ensureStringArray(complianceRaw.findings, ["待模型补全"]),
+        remediation: ensureStringArray(complianceRaw.remediation, ["待模型补全"]),
+      },
+      ip: {
+        filingPlan: ensureStringArray(ipRaw.filingPlan, ["待模型补全"]),
+        watchList: ensureStringArray(ipRaw.watchList, ["待模型补全"]),
+      },
     };
   }
 }

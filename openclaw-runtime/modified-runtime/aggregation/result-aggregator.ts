@@ -77,9 +77,16 @@ export class ResultAggregator {
   };
 
   constructor(config: ResultAggregatorConfig = {}) {
-    const apiKey = config.blenderApiKey ?? readEnv("BLENDER_API_KEY");
-    const model = config.blenderModel ?? readEnv("BLENDER_MODEL") ?? "gpt-4";
-    const baseUrl = config.blenderBaseUrl ?? readEnv("BLENDER_BASE_URL");
+    const apiKey = config.blenderApiKey
+      ?? readEnv("BLENDER_API_KEY")
+      ?? readEnv("AGENT_LLM_API_KEY");
+    const model = config.blenderModel
+      ?? readEnv("BLENDER_MODEL")
+      ?? readEnv("AGENT_LLM_MODEL")
+      ?? "gpt-4";
+    const baseUrl = config.blenderBaseUrl
+      ?? readEnv("BLENDER_BASE_URL")
+      ?? readEnv("AGENT_LLM_BASE_URL");
     const adapterConfig: ConstructorParameters<typeof LLMBlenderAdapter>[0] = {
       model,
     };
@@ -187,7 +194,8 @@ export class ResultAggregator {
     const businessValue = this.buildBusinessValueSummary(departmentLookup.strategy, departmentLookup.market);
     const riskView = this.buildRiskSummary(departmentLookup.legal, departmentLookup.market, departmentLookup.sales);
     const priorityOrder = this.buildPriorityOrder(feasibilityScore, businessValueRating, riskLevel);
-    let nextStep = this.buildNextStep(feasibilityVerdict, businessValueRating, riskLevel, priorityOrder);
+    const nextStepFromAgent = this.extractNextStepFromAgentOutputs(departmentLookup);
+    let nextStep = nextStepFromAgent ?? this.buildNextStep(feasibilityVerdict, businessValueRating, riskLevel, priorityOrder);
     const blockedByApproval = execution.blockedByApproval;
     const highlights = [
       `综合可行性评分 ${feasibilityScore}/100，建议 ${feasibilityVerdict}`,
@@ -226,6 +234,65 @@ export class ResultAggregator {
       nextStep,
       warnings,
     };
+  }
+
+  private extractNextStepFromAgentOutputs(departmentLookup: Record<string, DepartmentOutput>): string | null {
+    const orderedDepartments: DepartmentName[] = ["strategy", "research", "sales", "market", "legal"];
+    const candidates: string[] = [];
+
+    for (const department of orderedDepartments) {
+      const output = departmentLookup[department]?.output;
+      if (!output || typeof output !== "object") {
+        continue;
+      }
+
+      const typedOutput = output as Record<string, unknown>;
+      const found = this.readActionCandidatesByPaths(typedOutput, [
+        ["report", "nextSteps"],
+        ["report", "recommendations"],
+        ["strategy", "actionPlan"],
+        ["conversion", "stages"],
+        ["compliance", "remediation"],
+      ]);
+
+      candidates.push(...found);
+    }
+
+    const firstAction = candidates.find((item) => item.trim().length > 0);
+
+    if (!firstAction) {
+      return null;
+    }
+
+    return firstAction;
+  }
+
+  private readActionCandidatesByPaths(output: Record<string, unknown>, paths: string[][]): string[] {
+    const results: string[] = [];
+
+    for (const path of paths) {
+      const resolved = this.getValueByPath(output, path);
+      if (typeof resolved === "string" && resolved.trim().length > 0) {
+        results.push(resolved.trim());
+        continue;
+      }
+
+      if (Array.isArray(resolved)) {
+        results.push(...resolved
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0));
+        continue;
+      }
+
+      if (resolved && typeof resolved === "object") {
+        results.push(...this.collectStringList(resolved)
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0));
+      }
+    }
+
+    return Array.from(new Set(results));
   }
 
   private buildDepartmentQualityScores(outputs: DepartmentOutput[]): Record<DepartmentName, DepartmentQualityScore> {
@@ -837,14 +904,14 @@ export class ResultAggregator {
     riskLevel: "低" | "中" | "高",
     priorityOrder: string[],
   ): string {
-    const firstStep = priorityOrder[0] ?? "继续推进验证";
+    const firstStep = priorityOrder[0] ?? "请根据本轮模型输出补充下一步动作";
     if (feasibilityVerdict === "暂停") {
-      return `先暂停对外推进，补齐关键证据后再启动。建议先做：${firstStep}`;
+      return firstStep;
     }
     if (businessValueRating === "高" && riskLevel !== "高") {
-      return `进入小范围试点，优先验证商业闭环。建议先做：${firstStep}`;
+      return firstStep;
     }
-    return `受控推进下一轮验证，避免过早扩张。建议先做：${firstStep}`;
+    return firstStep;
   }
 
   private extractRiskCount(legal?: DepartmentOutput): number {
