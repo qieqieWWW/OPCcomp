@@ -18,10 +18,9 @@ def _contains_any(text: str, keywords: List[str]) -> bool:
 
 def _forced_agents_from_text(user_text: str, experts: List[Dict[str, str]]) -> Set[str]:
     alias_map = {
-        "strategy_agent": ["strategy_agent", "战略", "战略部", "strategy"],
-        "research_agent": ["research_agent", "研发", "研发部", "research", "r&d"],
-        "market_agent": ["market_agent", "市场", "市场部", "market", "marketing"],
-        "sales_agent": ["sales_agent", "销售", "销售部", "sales"],
+        "feasibility_agent": ["feasibility_agent", "可行性", "feasibility", "评估部", "strategy"],
+        "evidence_agent": ["evidence_agent", "证据", "对标", "evidence", "research", "research_agent"],
+        "risk_agent": ["risk_agent", "风险", "risk", "risk assessment", "market_agent", "市场"],
         "legal_agent": ["legal_agent", "法务", "法务部", "legal", "compliance"],
     }
     text = user_text.lower()
@@ -71,18 +70,18 @@ def load_experts(experts_path: str, prompts_dir: str | None = None) -> List[Dict
 
 def route_experts_by_tier(tier: str, experts: List[Dict[str, str]], user_text: str = "") -> List[Dict[str, str]]:
     emap = {str(e.get("name", "")): e for e in experts}
-    frontline = ["strategy_agent", "research_agent"]
-    execution = ["market_agent", "sales_agent"]
+    frontline = ["evidence_agent", "feasibility_agent"]
+    execution = ["risk_agent"]
 
     if tier == "L3":
         names = frontline + execution
     elif tier == "L2":
         names = frontline + execution
     else:
-        names = frontline + ["market_agent"]
+        names = frontline + ["risk_agent"]
 
-    if _need_legal_agent(user_text, experts):
-        names = frontline + ["legal_agent"] + [n for n in names if n not in frontline]
+    if "legal_agent" in emap:
+        names = frontline + ["legal_agent"] + [n for n in names if n not in frontline and n != "legal_agent"]
 
     forced = _forced_agents_from_text(user_text, experts)
     for name in forced:

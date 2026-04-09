@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 
 from .blender import fuse_rule_based, pairrank
@@ -23,7 +24,7 @@ class DynamicRoutingPipeline:
     def __post_init__(self) -> None:
         self.small_model = SmallModelRouter()
         self.experts_path = self.project_root / "config" / "experts.json"
-        self.prompts_dir = self.project_root.parent / "openclaw-runtime" / "prompts"
+        self.prompts_dir = self.project_root.parent / "opc-eval-runtime" / "prompts"
         self.info_pool_path = self.project_root / "config" / "info_pool.json"
         self.experts = load_experts(str(self.experts_path), prompts_dir=str(self.prompts_dir))
         self.info_pool = load_records(str(self.info_pool_path))
@@ -73,23 +74,36 @@ class DynamicRoutingPipeline:
             if source in names and target in names:
                 edges.append({"from": source, "to": target, "relation": relation})
 
-        add_edge("strategy_agent", "research_agent", "co-analyze")
-        add_edge("research_agent", "strategy_agent", "feasibility-feedback")
-        add_edge("strategy_agent", "market_agent", "handoff-plan")
-        add_edge("research_agent", "market_agent", "handoff-product-insight")
-        add_edge("market_agent", "sales_agent", "execute-go-to-market")
+        add_edge("feasibility_agent", "evidence_agent", "question-refine")
+        add_edge("evidence_agent", "feasibility_agent", "evidence-feedback")
+        add_edge("feasibility_agent", "risk_agent", "handoff-feasibility")
+        add_edge("evidence_agent", "risk_agent", "handoff-evidence")
 
         if "legal_agent" in names:
-            for upstream in ["strategy_agent", "research_agent", "market_agent", "sales_agent"]:
+            for upstream in ["evidence_agent", "feasibility_agent", "risk_agent"]:
                 add_edge(upstream, "legal_agent", "compliance-request")
 
         return {
             "mode": "dynamic-bypass-enabled",
-            "frontline": [x for x in ["strategy_agent", "research_agent"] if x in names],
-            "execution": [x for x in ["market_agent", "sales_agent"] if x in names],
+            "frontline": [x for x in ["evidence_agent", "feasibility_agent"] if x in names],
+            "execution": [x for x in ["risk_agent"] if x in names],
             "support": [x for x in ["legal_agent"] if x in names],
             "nodes": nodes,
             "edges": edges,
+        }
+
+    def _build_transient_info_hit(self, user_text: str) -> Dict[str, Any]:
+        text = (user_text or "").strip()
+        tokens = [x for x in re.split(r"[\s,，。；;：:！!？?、/\\]+", text) if len(x) >= 2][:8]
+        return {
+            "score": 1.0,
+            "record": {
+                "title": "当前任务输入",
+                "industry": "dynamic",
+                "keywords": tokens,
+                "guideline": text,
+            },
+            "source": "transient_current_task",
         }
 
     def _build_output_attribution(self, remote_called: bool, remote_available: bool) -> Dict[str, Any]:
@@ -125,13 +139,75 @@ class DynamicRoutingPipeline:
             },
         }
 
+    def _infer_intent(self, user_text: str, small_model_result: Dict[str, Any]) -> Dict[str, Any]:
+        text = (user_text or "").strip()
+        score = float(small_model_result.get("score", 0.0) or 0.0)
+        text_len = len(text)
+        has_digits = any(ch.isdigit() for ch in text)
+        question_like = ("?" in text) or ("？" in text)
+
+        # 轻量意图评分：依赖复杂度分、文本长度与任务结构信号，不依赖问候词硬编码。
+        task_likelihood = 0.0
+        task_likelihood += min(0.6, max(0.0, score / 10.0) * 0.6)
+        task_likelihood += 0.2 if text_len >= 18 else 0.05
+        task_likelihood += 0.1 if has_digits else 0.0
+        task_likelihood += 0.05 if not question_like else 0.0
+
+        intent_type = "task_request" if task_likelihood >= 0.45 else "conversation_query"
+        confidence = round(min(0.99, max(0.05, task_likelihood if intent_type == "task_request" else 1.0 - task_likelihood)), 4)
+
+        return {
+            "type": intent_type,
+            "confidence": confidence,
+            "reason": f"score={score:.2f}, len={text_len}, digits={has_digits}, question_like={question_like}",
+        }
+
     def run(self, user_text: str, try_remote_llm: bool = False) -> Dict[str, Any]:
         small_model_result = self.small_model.route(user_text)
         score = float(small_model_result.get("score", 0.0))
         tier = str(small_model_result.get("tier", "L1"))
+        intent = self._infer_intent(user_text, small_model_result)
+
+        if intent["type"] != "task_request":
+            return {
+                "small_model": {
+                    "score": score,
+                    "tier": tier,
+                    "backend": small_model_result.get("backend", "heuristic"),
+                    "backend_reason": small_model_result.get("backend_reason", ""),
+                },
+                "intent": intent,
+                "selected_experts": [],
+                "collaboration_plan": {
+                    "mode": "conversation-shortcut",
+                    "frontline": [],
+                    "execution": [],
+                    "support": [],
+                    "nodes": [],
+                    "edges": [],
+                },
+                "info_pool_hits": [],
+                "ranked_candidates": [],
+                "fused_result": {},
+                "remote_llm": None,
+                "output_attribution": self._build_output_attribution(remote_called=False, remote_available=False),
+                "runtime_trace": {
+                    "small_model_called": True,
+                    "small_model_callsite": "pipeline.run -> SmallModelRouter.route",
+                    "small_model_backend": small_model_result.get("backend", "heuristic"),
+                    "small_model_backend_reason": small_model_result.get("backend_reason", ""),
+                    "remote_llm_called": False,
+                    "provider": self.provider,
+                    "model": self.service_model,
+                },
+            }
+
         selected_experts = route_experts_by_tier(tier, self.experts, user_text=user_text)
 
-        info_hits = retrieve_from_info_pool(user_text, self.info_pool, top_k=3)
+        info_hits = [
+            self._build_transient_info_hit(user_text),
+            *retrieve_from_info_pool(user_text, self.info_pool, top_k=3),
+        ]
 
         candidates = [self._build_local_candidate(e, user_text, info_hits) for e in selected_experts]
         ranked = pairrank(candidates)
@@ -153,6 +229,7 @@ class DynamicRoutingPipeline:
                 "backend": small_model_result.get("backend", "heuristic"),
                 "backend_reason": small_model_result.get("backend_reason", ""),
             },
+            "intent": intent,
             "selected_experts": selected_experts,
             "collaboration_plan": self._build_collaboration_plan(selected_experts),
             "info_pool_hits": info_hits,

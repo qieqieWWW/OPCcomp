@@ -22,7 +22,7 @@ OPC（一人公司 AI 系统）- "替老板干活" 的 AI 团队。
 
 ## 当前已完成
 - 小模型路由骨架已迁移到 [competition_router](competition_router/)。
-- 五部门 Agent、skills、prompts、runtime 基础框架已建立在 [openclaw-runtime](openclaw-runtime/)。
+- 五部门 Agent、skills、prompts、runtime 基础框架已建立在 [opc-eval-runtime](opc-eval-runtime/)。
 - 结构化看板 UI 已建立在 [competition_router/ui](competition_router/ui/)，用于把 JSON 结果图形化展示。
 - 支持先用 DeepSeek 做联调，后续再切回赛事千帆。
 

@@ -102,6 +102,7 @@ class OPCServiceHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "small_model": result.get("small_model", {}),
+                    "intent": result.get("intent", {}),
                     "selected_experts": result.get("selected_experts", []),
                     "collaboration_plan": result.get("collaboration_plan", {}),
                     "info_pool_hits": result.get("info_pool_hits", []),

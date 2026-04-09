@@ -1,48 +1,39 @@
 [
   {
     "name": "legal_agent",
-    "role": "法务部",
+    "role": "法律与合规部",
     "risk_focus": "extreme_high,high,medium",
     "prompt_file": "legal-agent.prompt.md",
     "collab_phase": "support",
-    "depends_on": ["strategy_agent", "research_agent", "market_agent", "sales_agent"],
-    "support_targets": ["strategy_agent", "research_agent", "market_agent", "sales_agent"],
+    "depends_on": ["evidence_agent", "feasibility_agent", "risk_agent"],
+    "support_targets": ["evidence_agent", "feasibility_agent", "risk_agent"],
     "keywords": ["合规", "法规", "监管", "资质", "证书", "许可", "跨境"]
   },
   {
-    "name": "strategy_agent",
-    "role": "战略部",
+    "name": "feasibility_agent",
+    "role": "可行性评估部",
     "risk_focus": "high,medium,low",
-    "prompt_file": "strategy-agent.prompt.md",
+    "prompt_file": "feasibility-agent.prompt.md",
     "collab_phase": "frontline",
     "depends_on": [],
-    "support_targets": ["research_agent", "market_agent", "sales_agent", "legal_agent"]
+    "support_targets": ["evidence_agent", "risk_agent", "legal_agent"]
   },
   {
-    "name": "market_agent",
-    "role": "市场部",
+    "name": "risk_agent",
+    "role": "风险评估部",
     "risk_focus": "medium,low",
-    "prompt_file": "market-agent.prompt.md",
+    "prompt_file": "risk-agent.prompt.md",
     "collab_phase": "execution",
-    "depends_on": ["strategy_agent", "research_agent"],
-    "support_targets": ["sales_agent", "legal_agent"]
-  },
-  {
-    "name": "sales_agent",
-    "role": "销售部",
-    "risk_focus": "medium,low",
-    "prompt_file": "sales-agent.prompt.md",
-    "collab_phase": "execution",
-    "depends_on": ["strategy_agent", "research_agent", "market_agent"],
+    "depends_on": ["evidence_agent", "feasibility_agent"],
     "support_targets": ["legal_agent"]
   },
   {
-    "name": "research_agent",
-    "role": "研发部",
+    "name": "evidence_agent",
+    "role": "项目证据与对标部",
     "risk_focus": "high,medium",
-    "prompt_file": "research-agent.prompt.md",
+    "prompt_file": "evidence-agent.prompt.md",
     "collab_phase": "frontline",
     "depends_on": [],
-    "support_targets": ["strategy_agent", "market_agent", "sales_agent", "legal_agent"]
+    "support_targets": ["feasibility_agent", "risk_agent", "legal_agent"]
   }
 ]
