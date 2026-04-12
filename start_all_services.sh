@@ -5,7 +5,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 NPM_BIN="$(command -v npm || true)"
-if [[ -d "$ROOT_DIR/opc-eval-runtime" ]]; then
+# 当前仓库 runtime 脚本位于根目录 package.json，只有在子目录确实存在 package.json 时才切换。
+if [[ -f "$ROOT_DIR/opc-eval-runtime/package.json" ]]; then
 	RUNTIME_DIR="$ROOT_DIR/opc-eval-runtime"
 else
 	RUNTIME_DIR="$ROOT_DIR"
@@ -16,6 +17,9 @@ else
 	ROUTER_ROOT=""
 fi
 
+OPC_ROUTER_PORT="${OPC_ROUTER_PORT:-18081}"
+OPC_ROUTER_URL="${OPC_ROUTER_URL:-http://127.0.0.1:${OPC_ROUTER_PORT}/route}"
+
 run_node_service() {
 	local npm_script="$1"
 	if [[ -z "$NPM_BIN" ]]; then
@@ -24,6 +28,7 @@ run_node_service() {
 	fi
 	(
 		cd "$RUNTIME_DIR"
+		export OPC_ROUTER_URL="$OPC_ROUTER_URL"
 		"$NPM_BIN" run "$npm_script"
 	) &
 }
@@ -53,13 +58,13 @@ echo "启动 OPCcomp 本地全链路服务"
 echo "========================================="
 
 echo ""
-echo "1) 启动 OPC Router (18080)..."
+echo "1) 启动 OPC Router (${OPC_ROUTER_PORT})..."
 if [[ -z "$ROUTER_ROOT" ]]; then
 	echo "   未找到 competition_router，跳过启动 OPC Router"
-elif is_listening 18080; then
-	echo "   端口 18080 已被占用，跳过启动 OPC Router"
+elif is_listening "$OPC_ROUTER_PORT"; then
+	echo "   端口 ${OPC_ROUTER_PORT} 已被占用，跳过启动 OPC Router"
 else
-	conda run -n Airouting bash -lc "cd '$ROUTER_ROOT' && PYTHONPATH=competition_router/src python competition_router/examples/opc_service.py --host 0.0.0.0 --port 18080" &
+	conda run -n Airouting bash -lc "cd '$ROUTER_ROOT' && PYTHONPATH=competition_router/src python competition_router/examples/opc_service.py --host 0.0.0.0 --port ${OPC_ROUTER_PORT}" &
 	OPC_PID=$!
 	sleep 3
 fi
@@ -86,8 +91,9 @@ echo "OPC Router PID: $OPC_PID"
 echo "Runtime Execute PID: $RUNTIME_PID"
 echo "Feishu Longlink PID: $FEISHU_PID"
 echo ""
-echo "验证端口: lsof -iTCP:18080 -sTCP:LISTEN"
+echo "验证端口: lsof -iTCP:${OPC_ROUTER_PORT} -sTCP:LISTEN"
 echo "验证端口: lsof -iTCP:30000 -sTCP:LISTEN"
+echo "运行时 OPC 地址: ${OPC_ROUTER_URL}"
 echo "按 Ctrl+C 停止本脚本拉起的所有服务"
 echo "========================================="
 

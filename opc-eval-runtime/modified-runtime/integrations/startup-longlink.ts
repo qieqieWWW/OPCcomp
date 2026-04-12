@@ -3,6 +3,7 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 
 type MessageReceiveEvent = {
   event?: {
@@ -54,6 +55,13 @@ const processedEventKeys = new Map<string, number>();
 const MESSAGE_DEDUP_WINDOW_MS = 5 * 60 * 1000; // 扩大到 5 分钟，防止飞书延迟重投
 // 正在处理中的消息 key，防止并发竞态
 const processingKeys = new Set<string>();
+const PROCESS_STARTED_AT_MS = Date.now();
+const STALE_EVENT_TOLERANCE_MS = 10 * 1000;
+const DEDUP_STORE_PATH = path.resolve(os.tmpdir(), "feishu-longlink-dedup.json");
+const LOCK_FILE_PATH = path.resolve(os.tmpdir(), "feishu-longlink.lock");
+
+acquireSingletonLock();
+loadDedupStore();
 
 class FeishuLonglinkBot {
   private readonly client: Lark.Client;
@@ -128,12 +136,23 @@ class FeishuLonglinkBot {
         const messageType = rawData.message?.message_type ?? "";
         const content = rawData.message?.content ?? "";
         const messageId = rawData.message?.message_id ?? "";
+        const createTimeRaw = (data as { create_time?: string | number }).create_time;
+        const createTimeMs = normalizeCreateTimeMs(createTimeRaw);
         const openId = rawData.sender?.sender_id?.open_id ?? "";
 
         if (!openId || !messageType) {
           // eslint-disable-next-line no-console
           console.warn("[feishu-longlink] 事件缺少必要字段，跳过", { messageType, openId, content });
           return;
+        }
+
+        if (Number.isFinite(createTimeMs) && createTimeMs > 0) {
+          // Skip historical replay events when process just restarted.
+          if (createTimeMs + STALE_EVENT_TOLERANCE_MS < PROCESS_STARTED_AT_MS) {
+            // eslint-disable-next-line no-console
+            console.log(`[feishu-longlink] 跳过历史回放消息: event_id=${eventId || "-"}, message_id=${messageId || "-"}`);
+            return;
+          }
         }
 
         const dedupKey = messageId || eventId;
@@ -152,34 +171,41 @@ class FeishuLonglinkBot {
           processingKeys.add(dedupKey);
         }
 
-        try {
-          await this.messageHandler({
-            message: {
-              content,
-              message_type: messageType,
-            },
-            sender: {
-              sender_id: {
-                open_id: openId,
+        // 飞书长连接要求事件处理及时返回；若阻塞过久会触发重推。
+        // 这里改为“快速返回 + 后台异步处理”，降低同一 event_id/message_id 的重投概率。
+        void (async () => {
+          try {
+            await this.messageHandler?.({
+              message: {
+                content,
+                message_type: messageType,
               },
-            },
-          });
-          // 只有在成功完成后才标记为已处理
-          if (dedupKey) {
-            markMessageAsProcessed(dedupKey);
+              sender: {
+                sender_id: {
+                  open_id: openId,
+                },
+              },
+            });
+            // 只有在成功完成后才标记为已处理
+            if (dedupKey) {
+              markMessageAsProcessed(dedupKey);
+            }
+          } catch (error) {
+            // 处理失败时清除标记，允许重试
+            if (dedupKey) {
+              clearMessageMark(dedupKey);
+            }
+            // 关键：不要把单条消息处理错误上抛到 WS 事件循环，避免进程被打崩后反复重启。
+            // eslint-disable-next-line no-console
+            console.error("[feishu-longlink] 单条消息处理失败（已吞掉错误，避免进程退出）:", error);
+          } finally {
+            // 处理完成后从进行中集合移除（无论成功还是失败）
+            if (dedupKey) {
+              processingKeys.delete(dedupKey);
+            }
           }
-        } catch (error) {
-          // 处理失败时清除标记，允许重试
-          if (dedupKey) {
-            clearMessageMark(dedupKey);
-          }
-          throw error;
-        } finally {
-          // 处理完成后从进行中集合移除（无论成功还是失败）
-          if (dedupKey) {
-            processingKeys.delete(dedupKey);
-          }
-        }
+        })();
+        return;
       },
     });
 
@@ -203,7 +229,7 @@ class FeishuLonglinkBot {
 const APP_ID = process.env.FEISHU_APP_ID ?? "";
 const APP_SECRET = process.env.FEISHU_APP_SECRET ?? "";
 const RUNTIME_EXECUTE_URL = process.env.FEISHU_RUNTIME_EXECUTE_URL ?? "http://127.0.0.1:30000/execute";
-const RUNTIME_TIMEOUT_MS = Number(process.env.FEISHU_RUNTIME_TIMEOUT_MS ?? "120000");
+const RUNTIME_TIMEOUT_MS = Number(process.env.FEISHU_RUNTIME_TIMEOUT_MS ?? "300000");
 
 if (!APP_ID || !APP_SECRET) {
   throw new Error("FEISHU_APP_ID / FEISHU_APP_SECRET 未配置，无法启动飞书长连接");
@@ -227,7 +253,7 @@ bot.on("message", async (event: BotMessageEvent) => {
   if (!text) {
     await bot.replyMessage(event, {
       msg_type: "text",
-      content: { text: "未识别到有效文本指令，请直接输入任务描述。" },
+      content: { text: "FAULT_CODE:ERR_EMPTY_INPUT" },
     });
     return;
   }
@@ -237,11 +263,11 @@ bot.on("message", async (event: BotMessageEvent) => {
 
   try {
     const runtimeResult = await callRuntime(text, openId);
-    const replyText = runtimeResult.result?.trim() ? runtimeResult.result : "处理完成";
+    const replyText = runtimeResult.result?.trim() ? runtimeResult.result : "FAULT_CODE:ERR_RUNTIME_EMPTY_RESULT";
 
     await bot.replyMessage(event, {
       msg_type: "text",
-      content: { text: clampText(replyText, 1600) },
+      content: { text: clampText(replyText, 3800) },
     });
   } catch (error) {
     // eslint-disable-next-line no-console
@@ -393,6 +419,15 @@ function mapRuntimeCode(code: string | undefined): string {
   return `ERR_${normalized}`;
 }
 
+function normalizeCreateTimeMs(value: unknown): number {
+  const numeric = Number(value ?? 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+  // 飞书字段可能是秒级时间戳（10位）或毫秒级（13位），统一转成毫秒。
+  return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+}
+
 function isDuplicateMessage(messageKey: string): boolean {
   const now = Date.now();
 
@@ -407,10 +442,136 @@ function isDuplicateMessage(messageKey: string): boolean {
 
 function markMessageAsProcessed(messageKey: string): void {
   processedEventKeys.set(messageKey, Date.now());
+  persistDedupStore();
 }
 
 function clearMessageMark(messageKey: string): void {
   processedEventKeys.delete(messageKey);
+  persistDedupStore();
+}
+
+function loadDedupStore(): void {
+  try {
+    if (!fs.existsSync(DEDUP_STORE_PATH)) {
+      return;
+    }
+    const raw = fs.readFileSync(DEDUP_STORE_PATH, "utf-8");
+    if (!raw.trim()) {
+      return;
+    }
+    const parsed = JSON.parse(raw) as Record<string, number>;
+    const now = Date.now();
+    for (const [key, ts] of Object.entries(parsed)) {
+      if (!Number.isFinite(ts)) {
+        continue;
+      }
+      if (now - ts <= MESSAGE_DEDUP_WINDOW_MS) {
+        processedEventKeys.set(key, ts);
+      }
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn("[feishu-longlink] dedup store 加载失败，忽略并继续。", error);
+  }
+}
+
+function persistDedupStore(): void {
+  try {
+    const now = Date.now();
+    const payload: Record<string, number> = {};
+    for (const [key, ts] of processedEventKeys.entries()) {
+      if (now - ts <= MESSAGE_DEDUP_WINDOW_MS) {
+        payload[key] = ts;
+      }
+    }
+    fs.writeFileSync(DEDUP_STORE_PATH, JSON.stringify(payload), "utf-8");
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn("[feishu-longlink] dedup store 持久化失败。", error);
+  }
+}
+
+function acquireSingletonLock(): number {
+  try {
+    const fd = fs.openSync(LOCK_FILE_PATH, "wx");
+    fs.writeFileSync(fd, `${process.pid}`, "utf-8");
+    process.on("exit", () => releaseSingletonLock(fd));
+    process.on("SIGINT", () => {
+      releaseSingletonLock(fd);
+      process.exit(0);
+    });
+    process.on("SIGTERM", () => {
+      releaseSingletonLock(fd);
+      process.exit(0);
+    });
+    return fd;
+  } catch {
+    let existingPid = 0;
+    try {
+      existingPid = Number(fs.readFileSync(LOCK_FILE_PATH, "utf-8").trim());
+      if (Number.isFinite(existingPid) && existingPid > 0 && isProcessAlive(existingPid)) {
+        // eslint-disable-next-line no-console
+        console.error(`[feishu-longlink] 检测到已有实例运行 (pid=${existingPid})，当前实例退出。`);
+        throw new Error("已有 feishu-longlink 实例运行，拒绝重复启动。");
+      }
+    } catch {
+      // ignore read errors
+    }
+
+    // 处理僵尸锁文件：锁文件存在但对应进程已不存在，清理后重试一次。
+    try {
+      if (fs.existsSync(LOCK_FILE_PATH)) {
+        fs.unlinkSync(LOCK_FILE_PATH);
+        // eslint-disable-next-line no-console
+        console.warn(`[feishu-longlink] 清理僵尸锁文件并重试启动: ${LOCK_FILE_PATH}, stale_pid=${existingPid || "unknown"}`);
+      }
+    } catch {
+      // ignore unlink errors
+    }
+
+    const retryFd = fs.openSync(LOCK_FILE_PATH, "wx");
+    fs.writeFileSync(retryFd, `${process.pid}`, "utf-8");
+    process.on("exit", () => releaseSingletonLock(retryFd));
+    process.on("SIGINT", () => {
+      releaseSingletonLock(retryFd);
+      process.exit(0);
+    });
+    process.on("SIGTERM", () => {
+      releaseSingletonLock(retryFd);
+      process.exit(0);
+    });
+    return retryFd;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EPERM") {
+      return true;
+    }
+    return false;
+  }
+}
+
+function releaseSingletonLock(fd: number): void {
+  try {
+    fs.closeSync(fd);
+  } catch {
+    // ignore
+  }
+  try {
+    if (fs.existsSync(LOCK_FILE_PATH)) {
+      fs.unlinkSync(LOCK_FILE_PATH);
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function loadDotEnv(): void {

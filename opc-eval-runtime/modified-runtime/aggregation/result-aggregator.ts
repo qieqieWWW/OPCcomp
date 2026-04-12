@@ -5,6 +5,7 @@ import type {
   AggregationMetadata,
   AggregatedRuntimeResult,
   BrainRouterOutput,
+  EvidenceBoundOutput,
   DepartmentQualityScore,
   DepartmentResultCard,
   EnhancedExecutionTrace,
@@ -95,6 +96,22 @@ function hashText(text: string): string {
   return `h${hash.toString(16)}`;
 }
 
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function isEvidenceStale(entry: EvidenceBoundOutput["evidence_registry"][number], nowMs: number): boolean {
+  const collectedMs = Date.parse(entry.collected_at);
+  if (!Number.isFinite(collectedMs)) {
+    return false;
+  }
+  const ttl = Number(entry.freshness_ttl_hours);
+  if (!Number.isFinite(ttl) || ttl <= 0) {
+    return false;
+  }
+  return nowMs - collectedMs > ttl * 60 * 60 * 1000;
+}
+
 export class ResultAggregator {
   private blenderAdapter: LLMBlenderAdapter;
   private fusionConfig: FusionConfig = {
@@ -139,6 +156,7 @@ export class ResultAggregator {
     const trace = this.buildEnhancedTrace(input.trace);
     const attribution = this.buildAttribution(input, cards);
     const fusedResult = await this.performFusion(cards);
+    const evidenceBoundOutput = this.buildEvidenceBoundOutput(input, cards, summary, fusedResult);
     const metadata = this.buildMetadata(input, quality, started);
 
     return {
@@ -160,6 +178,7 @@ export class ResultAggregator {
       executionTrace: trace,
       trace: input.trace,
       outputAttribution: attribution,
+      evidenceBoundOutput,
       fusedResult,
       metadata,
       startedAt: input.execution.startedAt,
@@ -185,7 +204,7 @@ export class ResultAggregator {
       department: output.department,
       status: output.status === "failed" ? "failed" : "completed",
       title: `${output.department} 部门结果`,
-      summary: this.buildOutputSummary(output.output),
+      summary: this.buildOutputSummary(output.department, output.output),
       sourceKeys,
       output: output.output,
       rawOutput: output.output,
@@ -201,8 +220,81 @@ export class ResultAggregator {
     };
   }
 
-  private buildOutputSummary(output: Record<string, unknown>): string {
+  private buildOutputSummary(department: DepartmentName, output: Record<string, unknown>): string {
     const actions = this.extractActions(output);
+    const joinList = (value: unknown, limit = 2): string => {
+      if (!Array.isArray(value)) {
+        return "";
+      }
+      const items = value
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter((item) => Boolean(item));
+      return items.slice(0, limit).join("；");
+    };
+
+    if (department === "feasibility") {
+      const score = this.readFeasibilityScore({ output } as DepartmentOutput);
+      const recommendation = this.pickText(output, ["recommendation"]);
+      const market = this.pickText(output, ["market_feasibility"]);
+      const resource = this.pickText(output, ["resource_feasibility"]);
+      const timeline = this.pickText(output, ["timeline_feasibility"]);
+      const assumptions = joinList(output.assumptions, 2);
+      return [
+        `可行性评分 ${score}/100${recommendation ? `，建议 ${recommendation}` : ""}`,
+        market ? `市场：${market}` : null,
+        resource ? `资源：${resource}` : null,
+        timeline ? `时间：${timeline}` : null,
+        assumptions ? `关键假设：${assumptions}` : null,
+      ].filter((item): item is string => Boolean(item)).join("；");
+    }
+
+    if (department === "risk") {
+      const riskLevel = this.pickText(output, ["riskLevel"]) ?? "medium";
+      const riskSummary = this.pickText(output, ["riskSummary"]);
+      const blockers = joinList(output.blockers, 2);
+      const mitigation = joinList(output.mitigation, 2);
+      const goNoGo = this.pickText(output, ["goNoGo"]);
+      return [
+        `风险等级 ${riskLevel}`,
+        riskSummary ? `判断：${riskSummary}` : null,
+        blockers ? `阻塞项：${blockers}` : null,
+        mitigation ? `缓解：${mitigation}` : null,
+        goNoGo ? `决策：${goNoGo}` : null,
+      ].filter((item): item is string => Boolean(item)).join("；");
+    }
+
+    if (department === "legal") {
+      const risks = output.risks && typeof output.risks === "object" ? output.risks as Record<string, unknown> : {};
+      const compliance = output.compliance && typeof output.compliance === "object" ? output.compliance as Record<string, unknown> : {};
+      const ip = output.ip && typeof output.ip === "object" ? output.ip as Record<string, unknown> : {};
+      const highRisks = joinList(risks.high, 2);
+      const mediumRisks = joinList(risks.medium, 2);
+      const complianceFindings = joinList(compliance.findings, 2);
+      const remediation = joinList(compliance.remediation, 2);
+      const filingPlan = joinList(ip.filingPlan, 2);
+      return [
+        highRisks ? `高风险：${highRisks}` : null,
+        mediumRisks ? `中风险：${mediumRisks}` : null,
+        complianceFindings ? `合规发现：${complianceFindings}` : null,
+        remediation ? `整改：${remediation}` : null,
+        filingPlan ? `知识产权：${filingPlan}` : null,
+      ].filter((item): item is string => Boolean(item)).join("；");
+    }
+
+    if (department === "evidence") {
+      const report = output.report && typeof output.report === "object" ? output.report as Record<string, unknown> : {};
+      const executiveSummary = this.pickText(report, ["executiveSummary"]);
+      const detailedAnalysis = this.pickText(report, ["detailedAnalysis"]);
+      const recommendations = joinList(report.recommendations, 2);
+      const nextSteps = joinList(report.nextSteps, 2);
+      return [
+        executiveSummary ?? this.pickText(output, ["summary", "technicalSummary"]),
+        detailedAnalysis ? `分析：${detailedAnalysis}` : null,
+        recommendations ? `建议：${recommendations}` : null,
+        nextSteps ? `下一步：${nextSteps}` : null,
+      ].filter((item): item is string => Boolean(item)).join("；");
+    }
+
     if (actions.length > 0) {
       return actions.slice(0, 2).join("；");
     }
@@ -211,6 +303,183 @@ export class ResultAggregator {
       return "无结构化输出";
     }
     return `包含字段：${keys.slice(0, 4).join("、")}`;
+  }
+
+  private buildEvidenceBoundOutput(
+    input: ResultAggregationInput,
+    cards: DepartmentResultCard[],
+    summary: ExecutiveSummary,
+    fusedResult: FusedResult | null,
+  ): EvidenceBoundOutput {
+    const collectedAt = nowIso();
+    const evidenceRegistry: EvidenceBoundOutput["evidence_registry"] = [];
+    const evidenceByDepartment: Partial<Record<DepartmentName, string>> = {};
+
+    for (const card of cards) {
+      const evidenceId = this.buildEvidenceId(
+        "dataset",
+        `department:${card.department}`,
+        `${card.title}|${card.summary}|${safeStringify(card.normalizedOutput).slice(0, 240)}`,
+        collectedAt,
+      );
+      evidenceRegistry.push({
+        evidence_id: evidenceId,
+        evidence_type: "dataset",
+        source: `department:${card.department}`,
+        source_label: `${card.department} 部门输出`,
+        collected_at: collectedAt,
+        freshness_ttl_hours: 72,
+        snippet: card.summary,
+        checksum: hashText(safeStringify(card.normalizedOutput)),
+      });
+      evidenceByDepartment[card.department] = evidenceId;
+    }
+
+    const claims: EvidenceBoundOutput["claims"] = [];
+    const primaryEvidenceIds = [
+      evidenceByDepartment.evidence,
+      evidenceByDepartment.feasibility,
+      evidenceByDepartment.risk,
+      evidenceByDepartment.legal,
+    ].filter((item): item is string => Boolean(item));
+
+    const addClaim = (payload: {
+      text: string;
+      evidence_ids: string[];
+      confidence: number;
+      scope: EvidenceBoundOutput["claims"][number]["scope"];
+      decision_type: EvidenceBoundOutput["claims"][number]["decision_type"];
+    }): void => {
+      const text = payload.text.trim();
+      const evidenceIds = Array.from(new Set(payload.evidence_ids.filter((item): item is string => Boolean(item))));
+      if (!text || evidenceIds.length === 0) {
+        return;
+      }
+
+      claims.push({
+        claim_id: `CLM-${String(claims.length + 1).padStart(3, "0")}`,
+        text,
+        evidence_ids: evidenceIds,
+        confidence: Math.max(0, Math.min(1, payload.confidence)),
+        scope: payload.scope,
+        decision_type: payload.decision_type,
+      });
+    };
+
+    if (summary.overview.trim()) {
+      addClaim({
+        text: summary.overview.trim(),
+        evidence_ids: primaryEvidenceIds.slice(0, Math.max(1, primaryEvidenceIds.length)),
+        confidence: Math.max(0.1, Math.min(0.99, summary.qualityScore / 100)),
+        scope: "short_term",
+        decision_type: "estimate",
+      });
+    }
+
+    if (summary.businessValue.trim()) {
+      addClaim({
+        text: summary.businessValue.trim(),
+        evidence_ids: [evidenceByDepartment.feasibility, evidenceByDepartment.evidence].filter((item): item is string => Boolean(item)),
+        confidence: 0.76,
+        scope: "short_term",
+        decision_type: "estimate",
+      });
+    }
+
+    if (summary.riskView.trim()) {
+      addClaim({
+        text: summary.riskView.trim(),
+        evidence_ids: [evidenceByDepartment.risk, evidenceByDepartment.legal].filter((item): item is string => Boolean(item)),
+        confidence: 0.74,
+        scope: "short_term",
+        decision_type: "estimate",
+      });
+    }
+
+    if (summary.nextStep.trim()) {
+      addClaim({
+        text: summary.nextStep.trim(),
+        evidence_ids: [evidenceByDepartment.legal, evidenceByDepartment.risk, evidenceByDepartment.feasibility].filter((item): item is string => Boolean(item)),
+        confidence: 0.82,
+        scope: "short_term",
+        decision_type: "recommendation",
+      });
+    }
+
+    const actions: EvidenceBoundOutput["actions"] = [];
+    for (let index = 0; index < Math.min(3, summary.priorityOrder.length); index += 1) {
+      const actionText = summary.priorityOrder[index];
+      if (!actionText) {
+        continue;
+      }
+      const evidenceIds = index === 0
+        ? [evidenceByDepartment.feasibility].filter((item): item is string => Boolean(item))
+        : [evidenceByDepartment.risk, evidenceByDepartment.legal].filter((item): item is string => Boolean(item));
+      actions.push({
+        action_id: `ACT-${String(index + 1).padStart(3, "0")}`,
+        text: actionText,
+        owner: index === 0 ? "feasibility" : index === 1 ? "risk" : "legal",
+        due_hint: index === 0 ? "T+3d" : index === 1 ? "T+5d" : "T+7d",
+        depends_on_evidence_ids: evidenceIds,
+      });
+    }
+
+    const conflicts: EvidenceBoundOutput["conflicts"] = [];
+    if (input.execution.failed.length > 0) {
+      conflicts.push({
+        conflict_id: "CFL-001",
+        claim_ids: claims.slice(0, 2).map((item) => item.claim_id),
+        evidence_ids: primaryEvidenceIds.slice(0, 2),
+        reason: `${input.execution.failed.length} 个部门执行失败，需要复核输出一致性。`,
+        resolution: "补齐失败部门输出后重新聚合。",
+      });
+    }
+
+    if (!fusedResult && cards.length > 0) {
+      conflicts.push({
+        conflict_id: "CFL-002",
+        claim_ids: claims.slice(0, 1).map((item) => item.claim_id),
+        evidence_ids: primaryEvidenceIds.slice(0, 1),
+        reason: "融合层未生成统一结果，说明多部门证据尚未达成一致。",
+        resolution: "优先补充统一总结层，再进入用户侧主回复。",
+      });
+    }
+
+    const evidenceIdSet = new Set(evidenceRegistry.map((item) => item.evidence_id));
+    const missingEvidenceLink = claims.some((item) => item.evidence_ids.some((id) => !evidenceIdSet.has(id)));
+    const nowMs = Date.now();
+    const staleEvidence = evidenceRegistry.some((entry) => isEvidenceStale(entry, nowMs));
+    const noEvidence = claims.length === 0 || claims.some((item) => item.evidence_ids.length === 0) || missingEvidenceLink;
+    const conflictPresent = conflicts.length > 0;
+    const degraded = noEvidence || staleEvidence || conflictPresent;
+    const degradeReason = noEvidence
+      ? "NO_EVIDENCE"
+      : conflictPresent
+        ? "EVIDENCE_CONFLICT"
+        : staleEvidence
+          ? "STALE_EVIDENCE"
+          : "";
+    const coverage = claims.length === 0
+      ? 0
+      : Math.round((claims.filter((item) => item.evidence_ids.length > 0).length / claims.length) * 10000) / 10000;
+
+    return {
+      claims,
+      evidence_registry: evidenceRegistry,
+      conflicts,
+      actions,
+      output_meta: {
+        coverage,
+        conflict_present: conflictPresent,
+        degraded,
+        degrade_reason: degradeReason,
+      },
+    };
+  }
+
+  private buildEvidenceId(evidenceType: EvidenceBoundOutput["evidence_registry"][number]["evidence_type"], source: string, snippet: string, collectedAt: string): string {
+    const seed = `${evidenceType}|${source}|${snippet}`;
+    return `EVD-${evidenceType}-${collectedAt.slice(0, 10).replace(/-/g, "")}-${hashText(seed).slice(1, 9)}`;
   }
 
   private extractActions(output: Record<string, unknown>): string[] {
@@ -293,14 +562,73 @@ export class ResultAggregator {
         : "暂停";
     const riskLevel = this.readRiskLevel(lookup.risk, lookup.legal);
     const businessValueRating: ExecutiveSummary["businessValueRating"] = feasibilityScore >= 75 ? "高" : feasibilityScore >= 55 ? "中" : "低";
-    const overview = this.pickText(lookup.feasibility?.output, ["summary", "recommendation", "valueProposition"])
-      ?? this.pickText(lookup.risk?.output, ["summary", "recommendation"])
-      ?? this.pickText(lookup.evidence?.output, ["summary", "recommendation"])
-      ?? "已完成多部门分析。";
-    const nextStep = this.extractActions(lookup.legal?.output ?? {}).at(0)
-      ?? this.extractActions(lookup.risk?.output ?? {}).at(0)
-      ?? this.extractActions(lookup.feasibility?.output ?? {}).at(0)
-      ?? "整理关键假设并启动为期 2 周的最小验证计划。";
+    const feasibilityOutput = lookup.feasibility?.output ?? {};
+    const riskOutput = lookup.risk?.output ?? {};
+    const legalOutput = lookup.legal?.output ?? {};
+    const evidenceOutput = lookup.evidence?.output ?? {};
+
+    const feasibilityMarket = this.pickText(feasibilityOutput, ["market_feasibility"]);
+    const feasibilityResource = this.pickText(feasibilityOutput, ["resource_feasibility"]);
+    const feasibilityTimeline = this.pickText(feasibilityOutput, ["timeline_feasibility"]);
+    const feasibilityRecommendation = this.pickText(feasibilityOutput, ["recommendation"]);
+    const feasibilityAssumptions = this.pickList(feasibilityOutput, ["assumptions"], 2);
+
+    const riskSummary = this.pickText(riskOutput, ["riskSummary", "goNoGo"]);
+    const riskBlockers = this.pickList(riskOutput, ["blockers"], 2);
+    const legalFindings = this.pickList(legalOutput, ["compliance", "findings"], 2);
+    const legalRemediation = this.pickList(legalOutput, ["compliance", "remediation"], 2);
+    const evidenceSummary = this.pickText(evidenceOutput, ["report", "executiveSummary", "summary"])
+      ?? this.pickText(evidenceOutput, ["report", "detailedAnalysis"])
+      ?? this.pickText(evidenceOutput, ["summary"]);
+
+    const overview = [
+      `已完成${completedCount}个部门的分析${failedCount > 0 ? `，其中${failedCount}个部门未完成` : ""}。`,
+      `可行性评分 ${feasibilityScore}/100，建议 ${feasibilityVerdict}推进。`,
+      `质量评分 ${qualityScore}/100，评级 ${gradeFromScore(qualityScore)}。`,
+      `风险等级 ${riskLevel}。`,
+    ].join(" ");
+
+    const nextStep = this.firstText([
+      this.extractActions(lookup.legal?.output ?? {})[0],
+      this.extractActions(lookup.risk?.output ?? {})[0],
+      this.extractActions(lookup.feasibility?.output ?? {})[0],
+      legalRemediation[0],
+      riskBlockers[0],
+      feasibilityAssumptions[0],
+    ]) ?? "整理关键假设并启动为期 2 周的最小验证计划。";
+
+    const highlights = [
+      `可行性评分 ${feasibilityScore}/100，建议 ${feasibilityVerdict}`,
+      `质量评分 ${qualityScore}/100，评级 ${gradeFromScore(qualityScore)}`,
+      `风险等级 ${riskLevel}`,
+      feasibilityMarket ? `市场判断：${feasibilityMarket}` : null,
+      feasibilityResource ? `资源判断：${feasibilityResource}` : null,
+      feasibilityTimeline ? `时间判断：${feasibilityTimeline}` : null,
+      riskSummary ? `风险摘要：${riskSummary}` : null,
+      evidenceSummary ? `研究摘要：${evidenceSummary}` : null,
+    ].filter((item): item is string => Boolean(item));
+
+    const businessValue = [
+      this.pickText(feasibilityOutput, ["market_feasibility", "resource_feasibility"]),
+      this.pickText(evidenceOutput, ["report", "executiveSummary"]),
+    ].filter((item): item is string => Boolean(item)).join("；") || "商业价值待进一步量化。";
+
+    const riskView = [
+      riskSummary,
+      legalFindings.length > 0 ? `合规关注：${legalFindings.join("；")}` : null,
+      legalRemediation.length > 0 ? `整改建议：${legalRemediation.join("；")}` : null,
+      riskBlockers.length > 0 ? `阻塞项：${riskBlockers.join("；")}` : null,
+    ].filter((item): item is string => Boolean(item)).join(" ") || "风险已纳入后续评估。";
+
+    const priorityOrder = this.pickList(legalOutput, ["compliance", "remediation"], 1)
+      .concat(this.pickList(riskOutput, ["mitigation"], 1))
+      .concat(this.pickList(feasibilityOutput, ["assumptions"], 1))
+      .filter((item, index, all) => all.indexOf(item) === index)
+      .slice(0, 3);
+
+    if (priorityOrder.length === 0) {
+      priorityOrder.push("验证核心假设", "控制合规风险", "推进最小可行产品");
+    }
 
     return {
       headline: execution.blockedByApproval ? `${taskPlan.taskId} 等待审批` : `${taskPlan.taskId} 执行完成`,
@@ -313,16 +641,15 @@ export class ResultAggregator {
       feasibilityVerdict,
       businessValueRating,
       riskLevel,
-      highlights: [
-        `可行性评分 ${feasibilityScore}/100，建议 ${feasibilityVerdict}`,
-        `质量评分 ${qualityScore}/100，评级 ${gradeFromScore(qualityScore)}`,
-        `风险等级 ${riskLevel}`,
-      ],
-      businessValue: this.pickText(lookup.feasibility?.output, ["valueProposition", "summary", "recommendation"]) ?? "商业价值待进一步量化。",
-      riskView: this.pickText(lookup.legal?.output, ["summary", "riskLevel", "compliance"]) ?? "风险已纳入后续评估。",
-      priorityOrder: ["验证核心假设", "控制合规风险", "推进最小可行产品"],
+      highlights,
+      businessValue,
+      riskView,
+      priorityOrder,
       nextStep,
-      warnings: failedCount > 0 ? [`${failedCount} 个部门执行失败，需复盘后重试。`] : [],
+      warnings: [
+        ...(failedCount > 0 ? [`${failedCount} 个部门执行失败，需复盘后重试。`] : []),
+        ...(feasibilityScore < 60 ? ["可行性评分偏低，建议先做最小验证而非直接放大投入。"] : []),
+      ],
     };
   }
 
@@ -360,6 +687,38 @@ export class ResultAggregator {
     }
     for (const key of keys) {
       const value = output[key];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+    return null;
+  }
+
+  private pickList(output: Record<string, unknown> | undefined, keys: string[], limit = 2): string[] {
+    if (!output) {
+      return [];
+    }
+
+    let current: unknown = output;
+    for (const key of keys) {
+      if (!current || typeof current !== "object") {
+        return [];
+      }
+      current = (current as Record<string, unknown>)[key];
+    }
+
+    if (!Array.isArray(current)) {
+      return [];
+    }
+
+    return current
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter((item) => Boolean(item))
+      .slice(0, limit);
+  }
+
+  private firstText(values: Array<string | null | undefined>): string | null {
+    for (const value of values) {
       if (typeof value === "string" && value.trim()) {
         return value.trim();
       }

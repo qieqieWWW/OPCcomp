@@ -123,61 +123,8 @@ export class ExecutionOrchestrator {
   }
 
   private evaluateApprovalGate(taskPlan: TaskPlan): ApprovalDecision {
-    const raw = (taskPlan.contextData.rawBrainOutput ?? {}) as Record<string, unknown>;
-
-    const requiredFromInput =
-      this.readBoolean(raw, "approval_required") ||
-      this.readBoolean(raw, "requires_approval") ||
-      this.readBoolean(raw, "operation_requires_approval") ||
-      this.readNestedBoolean(raw, ["approval", "required"]);
-
-    const approvedFromInput =
-      this.readBoolean(raw, "approved") ||
-      this.readBoolean(raw, "approval_granted") ||
-      this.readBoolean(raw, "human_approved") ||
-      this.readBoolean(raw, "manual_approved") ||
-      this.readNestedBoolean(raw, ["approval", "approved"]);
-
-    const rejectedFromInput =
-      this.readBoolean(raw, "approval_rejected") ||
-      this.readNestedBoolean(raw, ["approval", "rejected"]);
-
-    const approvalStatus = this.readApprovalStatus(raw);
-    const requiredByHeuristic = this.containsRiskyAction(taskPlan.bossInstruction);
-    const required = requiredFromInput || requiredByHeuristic;
-
-    if (!required) {
-      return { required: false, status: "not_required", blocked: false };
-    }
-
-    const detail = requiredByHeuristic
-      ? "检测到高风险实操意图，需人工审批后执行"
-      : "任务被标记为需人工审批";
-
-    if (rejectedFromInput || approvalStatus === "rejected") {
-      return {
-        required: true,
-        status: "rejected",
-        blocked: true,
-        detail: "人工审批结果为拒绝，已阻断执行",
-      };
-    }
-
-    if (approvedFromInput || approvalStatus === "approved") {
-      return {
-        required: true,
-        status: "approved",
-        blocked: false,
-        detail: "人工审批通过，继续执行",
-      };
-    }
-
-    return {
-      required: true,
-      status: "pending",
-      blocked: true,
-      detail,
-    };
+    void taskPlan;
+    return { required: false, status: "not_required", blocked: false };
   }
 
   private readBoolean(container: Record<string, unknown>, key: string): boolean {

@@ -173,6 +173,55 @@ export interface ExecutiveSummary {
   warnings: string[];
 }
 
+export interface EvidenceClaim {
+  claim_id: string;
+  text: string;
+  evidence_ids: string[];
+  confidence: number;
+  scope: "short_term" | "mid_term" | "long_term";
+  decision_type: "fact" | "estimate" | "recommendation";
+}
+
+export interface EvidenceRegistryEntry {
+  evidence_id: string;
+  evidence_type: "dataset" | "rule" | "simulation" | "web" | "profile";
+  source: string;
+  source_label: string;
+  collected_at: string;
+  freshness_ttl_hours: number;
+  snippet: string;
+  checksum?: string;
+}
+
+export interface EvidenceConflict {
+  conflict_id: string;
+  claim_ids: string[];
+  evidence_ids: string[];
+  reason: string;
+  resolution: string;
+}
+
+export interface EvidenceAction {
+  action_id: string;
+  text: string;
+  owner: string;
+  due_hint: string;
+  depends_on_evidence_ids: string[];
+}
+
+export interface EvidenceBoundOutput {
+  claims: EvidenceClaim[];
+  evidence_registry: EvidenceRegistryEntry[];
+  conflicts: EvidenceConflict[];
+  actions: EvidenceAction[];
+  output_meta: {
+    coverage: number;
+    conflict_present: boolean;
+    degraded: boolean;
+    degrade_reason: string;
+  };
+}
+
 export interface OutputAttribution {
   taskId: string;
   brain: Record<string, unknown>;
@@ -209,6 +258,7 @@ export interface AggregatedRuntimeResult {
   executionTrace: EnhancedExecutionTrace;
   trace: ExecutionEvent[];
   outputAttribution: OutputAttribution;
+  evidenceBoundOutput?: EvidenceBoundOutput;
   fusedResult: FusedResult | null;
   metadata: AggregationMetadata;
   startedAt: Date;

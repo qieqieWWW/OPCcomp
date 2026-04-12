@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import re
+import sys
 from typing import Any, Dict, List, Optional
 
 from .blender import fuse_rule_based, pairrank
@@ -10,6 +12,48 @@ from .info_pool import load_records, retrieve_from_info_pool
 from .router import load_experts, route_experts_by_tier
 from .service_client import build_client
 from .small_model import SmallModelRouter
+
+
+def _load_knowledge_graph_retriever():
+    """Lazy-load knowledge graph retriever from scripts/m7 if available."""
+    try:
+        repo_root = Path(__file__).resolve().parents[4]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from scripts.m7.m7_knowledge_graph import retrieve_knowledge_graph_hits
+        return retrieve_knowledge_graph_hits
+    except ImportError:
+        return None
+
+
+_kg_retriever = _load_knowledge_graph_retriever()
+
+
+def _load_research_route_bridge():
+    """Lazy-load the research-side router so it can be used as an enhancement layer."""
+    try:
+        repo_root = Path(__file__).resolve().parents[4]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        scripts_m7_dir = repo_root / "scripts" / "m7"
+        if str(scripts_m7_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_m7_dir))
+        from scripts.m7.m7_router import route_experts
+        return route_experts
+    except ImportError:
+        return None
+
+
+_research_route_bridge = _load_research_route_bridge()
+
+
+def _tier_to_research_risk_level(tier: str) -> str:
+    mapping = {
+        "L3": "high",
+        "L2": "medium",
+        "L1": "low",
+    }
+    return mapping.get((tier or "").strip(), "medium")
 
 
 @dataclass
@@ -23,6 +67,9 @@ class DynamicRoutingPipeline:
 
     def __post_init__(self) -> None:
         self.small_model = SmallModelRouter()
+        self.task_intent_confidence_threshold = float(os.getenv("TASK_REQUEST_CONFIDENCE_THRESHOLD", "0.72"))
+        self.intent_parse_fallback_score_threshold = float(os.getenv("INTENT_PARSE_FALLBACK_SCORE_THRESHOLD", "5.0"))
+        self.intent_parse_fallback_text_length = int(os.getenv("INTENT_PARSE_FALLBACK_TEXT_LENGTH", "80"))
         self.experts_path = self.project_root / "config" / "experts.json"
         self.prompts_dir = self.project_root.parent / "opc-eval-runtime" / "prompts"
         self.info_pool_path = self.project_root / "config" / "info_pool.json"
@@ -106,6 +153,126 @@ class DynamicRoutingPipeline:
             "source": "transient_current_task",
         }
 
+    def _build_research_fusion(
+        self,
+        tier: str,
+        user_text: str,
+        selected_experts: List[Dict[str, Any]],
+        info_hits: List[Dict[str, Any]],
+        knowledge_graph_hits: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        comp_scores = {
+            str(expert.get("name", "")): max(0.1, 1.0 - (idx * 0.05))
+            for idx, expert in enumerate(selected_experts)
+            if str(expert.get("name", ""))
+        }
+
+        if _research_route_bridge is None:
+            return {
+                "enabled": False,
+                "reason": "research_route_bridge_unavailable",
+                "selected_experts": selected_experts,
+                "comp_scores": comp_scores,
+                "research_selected_experts": [],
+                "research_routing_scores": {},
+                "research_result": {},
+            }
+
+        try:
+            research_result = _research_route_bridge(
+                risk_level=_tier_to_research_risk_level(tier),
+                intermediate={},
+                project_data={},
+                user_input=user_text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "enabled": False,
+                "reason": f"research_route_bridge_error:{exc}",
+                "selected_experts": selected_experts,
+                "comp_scores": comp_scores,
+                "research_selected_experts": [],
+                "research_routing_scores": {},
+                "research_result": {},
+            }
+
+        research_selected_experts = [
+            str(expert.get("name", ""))
+            for expert in research_result.get("selected_experts", [])
+            if isinstance(expert, dict) and str(expert.get("name", ""))
+        ]
+        research_routing_scores = {
+            str(name): float(score)
+            for name, score in (research_result.get("routing_scores", {}) or {}).items()
+            if str(name)
+        }
+
+        bridge_map = {
+            "risk_guardian": {"risk_agent": 1.0, "legal_agent": 0.45, "feasibility_agent": 0.12},
+            "finance_advisor": {"feasibility_agent": 0.9, "evidence_agent": 0.15},
+            "ops_executor": {"feasibility_agent": 0.55, "evidence_agent": 0.45},
+            "growth_strategist": {"feasibility_agent": 0.35, "evidence_agent": 0.65},
+        }
+
+        for research_name, target_weights in bridge_map.items():
+            research_score = float(research_routing_scores.get(research_name, 0.0))
+            if research_name in research_selected_experts:
+                research_score += 0.08
+            for comp_name, weight in target_weights.items():
+                if comp_name in comp_scores:
+                    comp_scores[comp_name] += research_score * weight
+
+        if info_hits and "evidence_agent" in comp_scores:
+            comp_scores["evidence_agent"] += min(0.18, 0.03 * len(info_hits))
+
+        if knowledge_graph_hits and "evidence_agent" in comp_scores:
+            comp_scores["evidence_agent"] += min(0.18, 0.04 * len(knowledge_graph_hits))
+
+        legal_signals = 0
+        for hit in knowledge_graph_hits:
+            if not isinstance(hit, dict):
+                continue
+            text = " ".join(
+                str(hit.get(field, ""))
+                for field in ["relation", "source_label", "evidence_snippet", "node_label", "target_label"]
+            ).lower()
+            if any(token in text for token in ["legal", "compliance", "cross-border", "跨境", "法规", "合规"]):
+                legal_signals += 1
+
+        if legal_signals and "legal_agent" in comp_scores:
+            comp_scores["legal_agent"] += min(0.22, 0.05 * legal_signals)
+
+        intent_result = research_result.get("intent_result", {})
+        required_experts = intent_result.get("required_experts", []) if isinstance(intent_result, dict) else []
+        if isinstance(required_experts, list):
+            if "risk_guardian" in required_experts and "risk_agent" in comp_scores:
+                comp_scores["risk_agent"] += 0.15
+            if "finance_advisor" in required_experts and "feasibility_agent" in comp_scores:
+                comp_scores["feasibility_agent"] += 0.12
+            if "finance_advisor" in required_experts and "evidence_agent" in comp_scores:
+                comp_scores["evidence_agent"] += 0.05
+
+        ordered = sorted(
+            enumerate(selected_experts),
+            key=lambda item: (
+                comp_scores.get(str(item[1].get("name", "")), 0.0),
+                -item[0],
+            ),
+            reverse=True,
+        )
+        fused_selected_experts = [item[1] for item in ordered]
+
+        return {
+            "enabled": True,
+            "reason": research_result.get("route_reason", ""),
+            "selected_experts": fused_selected_experts,
+            "comp_scores": {name: round(score, 4) for name, score in comp_scores.items()},
+            "research_selected_experts": research_selected_experts,
+            "research_routing_scores": {name: round(score, 4) for name, score in research_routing_scores.items()},
+            "research_result": research_result,
+            "research_risk_level": _tier_to_research_risk_level(tier),
+        }
+
     def _build_output_attribution(self, remote_called: bool, remote_available: bool) -> Dict[str, Any]:
         return {
             "small_model": {
@@ -124,6 +291,10 @@ class DynamicRoutingPipeline:
                 "source": "info-pool-retriever",
                 "description": "由本地信息池检索召回 grounding",
             },
+            "research_fusion": {
+                "source": "scripts.m7.m7_router+bridge",
+                "description": "由研究侧多层评分提供增强信号，仅用于竞赛侧 agent 重排，不改变对外结构",
+            },
             "ranked_candidates": {
                 "source": "local-agent-simulator+pairrank",
                 "description": "由本地 agent 候选生成与 PairRank 排序得到",
@@ -140,35 +311,71 @@ class DynamicRoutingPipeline:
         }
 
     def _infer_intent(self, user_text: str, small_model_result: Dict[str, Any]) -> Dict[str, Any]:
-        text = (user_text or "").strip()
-        score = float(small_model_result.get("score", 0.0) or 0.0)
-        text_len = len(text)
-        has_digits = any(ch.isdigit() for ch in text)
-        question_like = ("?" in text) or ("？" in text)
+        return self.small_model.infer_intent(user_text, route_result=small_model_result)
 
-        # 轻量意图评分：依赖复杂度分、文本长度与任务结构信号，不依赖问候词硬编码。
-        task_likelihood = 0.0
-        task_likelihood += min(0.6, max(0.0, score / 10.0) * 0.6)
-        task_likelihood += 0.2 if text_len >= 18 else 0.05
-        task_likelihood += 0.1 if has_digits else 0.0
-        task_likelihood += 0.05 if not question_like else 0.0
-
-        intent_type = "task_request" if task_likelihood >= 0.45 else "conversation_query"
-        confidence = round(min(0.99, max(0.05, task_likelihood if intent_type == "task_request" else 1.0 - task_likelihood)), 4)
-
+    def _fallback_intent_when_parse_failed(self, user_text: str, score: float) -> Dict[str, Any]:
+        text_len = len((user_text or "").strip())
+        if score >= self.intent_parse_fallback_score_threshold or text_len >= self.intent_parse_fallback_text_length:
+            return {
+                "type": "task_request",
+                "confidence": 0.55,
+                "reason": f"intent_parse_fallback(score={score:.2f},len={text_len})",
+            }
         return {
-            "type": intent_type,
-            "confidence": confidence,
-            "reason": f"score={score:.2f}, len={text_len}, digits={has_digits}, question_like={question_like}",
+            "type": "conversation_query",
+            "confidence": 0.45,
+            "reason": f"intent_parse_fallback_conversation(score={score:.2f},len={text_len})",
         }
+
+    def _should_force_task_flow(self, user_text: str, score: float) -> bool:
+        text = (user_text or "").strip()
+        if not text:
+            return False
+
+        line_count = len([line for line in text.splitlines() if line.strip()])
+        if score >= self.intent_parse_fallback_score_threshold:
+            return True
+        if len(text) >= self.intent_parse_fallback_text_length:
+            return True
+        if line_count >= 3:
+            return True
+        return False
 
     def run(self, user_text: str, try_remote_llm: bool = False) -> Dict[str, Any]:
         small_model_result = self.small_model.route(user_text)
         score = float(small_model_result.get("score", 0.0))
         tier = str(small_model_result.get("tier", "L1"))
-        intent = self._infer_intent(user_text, small_model_result)
+        try:
+            intent = self._infer_intent(user_text, small_model_result)
+        except Exception as exc:  # noqa: BLE001
+            intent = self._fallback_intent_when_parse_failed(user_text, score)
+            intent_error = str(exc)
+        else:
+            intent_error = ""
+
+        if intent.get("type") == "task_request":
+            confidence = float(intent.get("confidence", 0.0))
+            force_task = self._should_force_task_flow(user_text, score)
+            if confidence < self.task_intent_confidence_threshold and not force_task:
+                intent = {
+                    "type": "conversation_query",
+                    "confidence": confidence,
+                    "reason": f"task_confidence_below_threshold({confidence:.3f}<{self.task_intent_confidence_threshold:.3f})",
+                }
+            elif confidence < self.task_intent_confidence_threshold and force_task:
+                intent = {
+                    "type": "task_request",
+                    "confidence": confidence,
+                    "reason": f"task_forced_by_complexity(score={score:.2f},len={len((user_text or '').strip())})",
+                }
 
         if intent["type"] != "task_request":
+            try:
+                conversation_reply = self.small_model.generate_reply(user_text)
+            except Exception as exc:  # noqa: BLE001
+                conversation_reply = "FAULT_CODE:ERR_CHAT_MODEL_PARSE"
+                if not intent_error:
+                    intent_error = str(exc)
             return {
                 "small_model": {
                     "score": score,
@@ -177,6 +384,7 @@ class DynamicRoutingPipeline:
                     "backend_reason": small_model_result.get("backend_reason", ""),
                 },
                 "intent": intent,
+                "conversation_reply": conversation_reply,
                 "selected_experts": [],
                 "collaboration_plan": {
                     "mode": "conversation-shortcut",
@@ -187,6 +395,15 @@ class DynamicRoutingPipeline:
                     "edges": [],
                 },
                 "info_pool_hits": [],
+                "research_fusion": {
+                    "enabled": False,
+                    "reason": "conversation_shortcut",
+                    "selected_experts": [],
+                    "comp_scores": {},
+                    "research_selected_experts": [],
+                    "research_routing_scores": {},
+                    "research_result": {},
+                },
                 "ranked_candidates": [],
                 "fused_result": {},
                 "remote_llm": None,
@@ -197,6 +414,10 @@ class DynamicRoutingPipeline:
                     "small_model_backend": small_model_result.get("backend", "heuristic"),
                     "small_model_backend_reason": small_model_result.get("backend_reason", ""),
                     "remote_llm_called": False,
+                    "small_model_error": intent_error,
+                    "task_intent_conf_threshold": self.task_intent_confidence_threshold,
+                    "intent_parse_fallback_score_threshold": self.intent_parse_fallback_score_threshold,
+                    "intent_parse_fallback_text_length": self.intent_parse_fallback_text_length,
                     "provider": self.provider,
                     "model": self.service_model,
                 },
@@ -208,6 +429,22 @@ class DynamicRoutingPipeline:
             self._build_transient_info_hit(user_text),
             *retrieve_from_info_pool(user_text, self.info_pool, top_k=3),
         ]
+
+        knowledge_graph_hits = []
+        if _kg_retriever is not None:
+            try:
+                knowledge_graph_hits = _kg_retriever(query=user_text, top_k=3)
+            except Exception:
+                pass
+
+        research_fusion = self._build_research_fusion(
+            tier=tier,
+            user_text=user_text,
+            selected_experts=selected_experts,
+            info_hits=info_hits,
+            knowledge_graph_hits=knowledge_graph_hits,
+        )
+        selected_experts = research_fusion.get("selected_experts", selected_experts)
 
         candidates = [self._build_local_candidate(e, user_text, info_hits) for e in selected_experts]
         ranked = pairrank(candidates)
@@ -233,6 +470,8 @@ class DynamicRoutingPipeline:
             "selected_experts": selected_experts,
             "collaboration_plan": self._build_collaboration_plan(selected_experts),
             "info_pool_hits": info_hits,
+            "knowledge_graph_hits": knowledge_graph_hits,
+            "research_fusion": research_fusion,
             "ranked_candidates": ranked,
             "fused_result": fused,
             "remote_llm": remote,
@@ -242,8 +481,13 @@ class DynamicRoutingPipeline:
                 "small_model_callsite": "pipeline.run -> SmallModelRouter.route",
                 "small_model_backend": small_model_result.get("backend", "heuristic"),
                 "small_model_backend_reason": small_model_result.get("backend_reason", ""),
+                "task_intent_conf_threshold": self.task_intent_confidence_threshold,
+                "intent_parse_fallback_score_threshold": self.intent_parse_fallback_score_threshold,
+                "intent_parse_fallback_text_length": self.intent_parse_fallback_text_length,
                 "remote_llm_called": remote_called,
                 "remote_llm_callsite": "pipeline.run -> self.client.chat",
+                "research_fusion_enabled": bool(research_fusion.get("enabled")),
+                "research_fusion_risk_level": research_fusion.get("research_risk_level", ""),
                 "provider": self.provider,
                 "model": self.service_model,
             },

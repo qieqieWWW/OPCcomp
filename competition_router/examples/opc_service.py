@@ -4,6 +4,7 @@ import argparse
 import importlib
 import json
 import os
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sys
@@ -59,11 +60,16 @@ class OPCServiceHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
+            small_model = getattr(self.pipeline, "small_model", None)
+            backend = getattr(small_model, "backend", "unknown") if small_model is not None else "unknown"
+            backend_reason = getattr(small_model, "backend_reason", "") if small_model is not None else ""
             self._send_json(
                 200,
                 {
                     "ok": True,
                     "service": "competition-router-opc",
+                    "small_model_backend": backend,
+                    "small_model_backend_reason": backend_reason,
                 },
             )
             return
@@ -75,6 +81,7 @@ class OPCServiceHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "not_found"})
             return
 
+        started_at = time.time()
         try:
             payload = self._read_json_body()
             input_text = str(payload.get("input", "")).strip()
@@ -83,6 +90,11 @@ class OPCServiceHandler(BaseHTTPRequestHandler):
             if not input_text:
                 self._send_json(400, {"ok": False, "error": "input is required"})
                 return
+
+            preview = input_text.replace("\n", " ").strip()
+            if len(preview) > 40:
+                preview = f"{preview[:40]}..."
+            print(f"[opc-service] /route start try_remote_llm={try_remote_llm} input='{preview}'")
 
             try:
                 result = self.pipeline.run(user_text=input_text, try_remote_llm=try_remote_llm)
@@ -103,6 +115,7 @@ class OPCServiceHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "small_model": result.get("small_model", {}),
                     "intent": result.get("intent", {}),
+                    "conversation_reply": result.get("conversation_reply"),
                     "selected_experts": result.get("selected_experts", []),
                     "collaboration_plan": result.get("collaboration_plan", {}),
                     "info_pool_hits": result.get("info_pool_hits", []),
@@ -111,6 +124,8 @@ class OPCServiceHandler(BaseHTTPRequestHandler):
                     "remote_llm": result.get("remote_llm"),
                 },
             )
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            print(f"[opc-service] /route done status=200 elapsed_ms={elapsed_ms}")
         except Exception as error:  # noqa: BLE001
             self._send_json(
                 500,
@@ -120,6 +135,8 @@ class OPCServiceHandler(BaseHTTPRequestHandler):
                     "message": str(error),
                 },
             )
+            elapsed_ms = int((time.time() - started_at) * 1000)
+            print(f"[opc-service] /route done status=500 elapsed_ms={elapsed_ms} error={error}")
 
     def _read_json_body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -150,7 +167,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=os.getenv("OPC_SERVICE_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("OPC_SERVICE_PORT", "18080")))
+    parser.add_argument("--port", type=int, default=int(os.getenv("OPC_SERVICE_PORT", "18081")))
     args = parser.parse_args()
 
     OPCServiceHandler.pipeline = build_pipeline()
