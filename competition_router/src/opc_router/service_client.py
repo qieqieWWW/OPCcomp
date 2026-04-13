@@ -1,5 +1,62 @@
 from __future__ import annotations
 
+import time
+import threading
+
+import requests
+
+# 千帆平台多agent专用client
+class QianfanAgentClient:
+    def __init__(self, app_id: str, api_key: str, secret_key: str, host: str = "https://qianfan.baidubce.com"):
+        self.app_id = app_id
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.host = host.rstrip("/")
+        self.conversation_id = None
+        self.conversation_expire = 0
+        self.lock = threading.Lock()
+
+    def _get_conversation_id(self):
+        now = time.time()
+        with self.lock:
+            if self.conversation_id and now < self.conversation_expire:
+                return self.conversation_id
+            url = f"{self.host}/v2/app/conversation"
+            payload = {"app_id": self.app_id}
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            self.conversation_id = data["conversation_id"]
+            self.conversation_expire = now + 6.5 * 24 * 3600  # 7天-半天
+            return self.conversation_id
+
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> Dict[str, Any]:
+        conv_id = self._get_conversation_id()
+        url = f"{self.host}/v2/app/chat"
+        payload = {
+            "app_id": self.app_id,
+            "conversation_id": conv_id,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        try:
+            resp.raise_for_status()
+            return {"ok": True, "status": resp.status_code, "raw": resp.json()}
+        except Exception:
+            try:
+                return {"ok": False, "status": resp.status_code, "raw": resp.json()}
+            except Exception:
+                return {"ok": False, "status": resp.status_code, "raw": {"error_message": resp.text}}
 import json
 import urllib.error
 import urllib.request

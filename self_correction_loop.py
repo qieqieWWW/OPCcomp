@@ -564,7 +564,6 @@ class SelfCorrectionLoop:
         initial_output: str,
         query: str,
         output_id: Optional[str] = None,
-        request_type: str = "task",
     ) -> SelfCorrectionResult:
         """
         执行自修正循环
@@ -573,7 +572,6 @@ class SelfCorrectionLoop:
             initial_output: 初始输出
             query: 用户查询
             output_id: 输出ID
-            request_type: 请求类型，task 表示任务请求，chat 表示闲聊/非任务请求
             
         Returns:
             SelfCorrectionResult
@@ -586,17 +584,9 @@ class SelfCorrectionLoop:
             final_output=initial_output,
         )
 
-        # Step 1: 时效性检查 + 请求类型策略
+        # Step 1: 时效性检查
         should_query, freshness_report = self.freshness_checker.check_freshness()
-        normalized_request_type = (request_type or "task").strip().lower()
-        if normalized_request_type in {"task", "task_request", "request", "work"}:
-            should_query = True
-            search_policy = "task_forces_web_search"
-        else:
-            search_policy = "chat_on_demand"
         self.logger.log_freshness_check(freshness_report, self.reference_date)
-
-        self.logger.logger.info(f"请求类型: {normalized_request_type or 'task'} | 搜索策略: {search_policy}")
 
         if not should_query and not self.orchestrator:
             self.logger.logger.info("知识足够新鲜，且无编排器，跳过修正")
@@ -627,11 +617,10 @@ class SelfCorrectionLoop:
                 orch_result = self.orchestrator.orchestrate(request)
                 evidence_list = orch_result.total_evidence
                 result.web_evidence_used = len(evidence_list) > 0
-                if normalized_request_type in {"task", "task_request", "request", "work"}:
-                    trigger_reason = "任务请求默认联网佐证与修正"
-                else:
-                    trigger_reason = f"知识过期（{', '.join([s for s, r in freshness_report.items() if r['freshness'] in ['stale', 'very_stale']])}）"
-                self.logger.log_web_search_triggered(trigger_reason, len(evidence_list))
+                self.logger.log_web_search_triggered(
+                    f"知识过期（{', '.join([s for s, r in freshness_report.items() if r['freshness'] in ['stale', 'very_stale']])}）",
+                    len(evidence_list)
+                )
             except Exception as e:
                 self.logger.logger.warning(f"互联网搜索失败: {e}")
 

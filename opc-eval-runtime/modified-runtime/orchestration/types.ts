@@ -179,18 +179,20 @@ export interface EvidenceClaim {
   evidence_ids: string[];
   confidence: number;
   scope: "short_term" | "mid_term" | "long_term";
-  decision_type: "fact" | "estimate" | "recommendation";
+  decision_type: "fact" | "estimate" | "recommendation" | "factual" | "reference" | "contextual";
 }
 
 export interface EvidenceRegistryEntry {
   evidence_id: string;
-  evidence_type: "dataset" | "rule" | "simulation" | "web" | "profile";
+  evidence_type: "dataset" | "rule" | "simulation" | "web" | "profile" | "knowledge_graph" | "info_pool";
   source: string;
   source_label: string;
   collected_at: string;
   freshness_ttl_hours: number;
   snippet: string;
   checksum?: string;
+  /** 真实证据的扩展元数据（KG关系/Web来源等），仅 knowledge_graph/web/info_pool 类型使用 */
+  metadata?: Record<string, unknown>;
 }
 
 export interface EvidenceConflict {

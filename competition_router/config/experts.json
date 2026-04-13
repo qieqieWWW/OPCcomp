@@ -7,7 +7,8 @@
     "collab_phase": "support",
     "depends_on": ["evidence_agent", "feasibility_agent", "risk_agent"],
     "support_targets": ["evidence_agent", "feasibility_agent", "risk_agent"],
-    "keywords": ["合规", "法规", "监管", "资质", "证书", "许可", "跨境"]
+    "keywords": ["合规", "法规", "监管", "资质", "证书", "许可", "跨境"],
+    "app_id": "307edb41-8370-4a24-99d6-d528b89ec253"
   },
   {
     "name": "feasibility_agent",
@@ -16,7 +17,8 @@
     "prompt_file": "feasibility-agent.prompt.md",
     "collab_phase": "frontline",
     "depends_on": [],
-    "support_targets": ["evidence_agent", "risk_agent", "legal_agent"]
+    "support_targets": ["evidence_agent", "risk_agent", "legal_agent"],
+    "app_id": "49e14f25-d38e-4fe0-8edf-d8f855d690ab"
   },
   {
     "name": "risk_agent",
@@ -25,7 +27,8 @@
     "prompt_file": "risk-agent.prompt.md",
     "collab_phase": "execution",
     "depends_on": ["evidence_agent", "feasibility_agent"],
-    "support_targets": ["legal_agent"]
+    "support_targets": ["legal_agent"],
+    "app_id": "b02b9673-e7ea-4105-83c0-83c942d74404"
   },
   {
     "name": "evidence_agent",
@@ -34,6 +37,7 @@
     "prompt_file": "evidence-agent.prompt.md",
     "collab_phase": "frontline",
     "depends_on": [],
-    "support_targets": ["feasibility_agent", "risk_agent", "legal_agent"]
+    "support_targets": ["feasibility_agent", "risk_agent", "legal_agent"],
+    "app_id": "be5117b4-2611-4afd-a112-820b475e40ad"
   }
 ]

@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import threading
 from pathlib import Path
 import os
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from .blender import fuse_rule_based, pairrank
+from .blender import fuse_rule_based, pairrank, normalize_agent_outputs, pairrank_from_candidates
 from .info_pool import load_records, retrieve_from_info_pool
 from .router import load_experts, route_experts_by_tier
 from .service_client import build_client
 from .small_model import SmallModelRouter
+ 
+# Optional self-correction imports (OPCcomp)
+try:
+    # try import from workspace OPCcomp package
+    from OPCcomp.self_correction_adapter import create_adapter_for_m9
+    from OPCcomp.accuracy_gate import AccuracyGate
+except Exception:
+    create_adapter_for_m9 = None
+    AccuracyGate = None
 
 
 def _load_knowledge_graph_retriever():
@@ -111,18 +122,110 @@ class DynamicRoutingPipeline:
             repo_root = (self.project_root / ".." / "..").resolve()
             if str(repo_root) not in sys.path:
                 sys.path.insert(0, str(repo_root))
-            
             from OPCcomp.evidence_orchestrator import EvidenceOrchestrator
-            from OPCcomp.web_retriever import WebRetriever
-            
+
+            # 支持通过千帆平台的多个 agent 做外部检索（当 WEB_ENGINE=qianfan 时）
+            class QianfanWebRetriever:
+                def __init__(self, app_ids: List[str], api_key: str, host: str = "https://qianfan.baidubce.com", cache_dir: str = "./web_cache"):
+                    self.app_ids = [a for a in (app_ids or []) if a]
+                    self.api_key = api_key or ""
+                    self.host = host
+                    self.cache_dir = cache_dir
+
+                def search_for_evidence(self, query: str, evidence_coverage: float = 0.0, evidence_type: str = "general", top_k: int = 3, force_refresh: bool = False):
+                    """
+                    使用千帆上注册的 agent 进行检索：将 query 发给每个 agent，期望返回结构化的证据列表或可解析的文本片段。
+                    返回值为 OPCcomp.accuracy_gate.Evidence 列表（或兼容对象）。
+                    """
+                    results = []
+                    try:
+                        from time import time
+                        from .service_client import QianfanAgentClient, extract_text
+                        from OPCcomp.accuracy_gate import Evidence, EvidenceStatus, ConfidenceLevel
+                    except Exception:
+                        return []
+
+                    for app_id in self.app_ids:
+                        try:
+                            client = QianfanAgentClient(app_id=app_id, api_key=self.api_key, secret_key=os.getenv("QIANFAN_SECRET_KEY", ""), host=self.host)
+                            system_prompt = (
+                                "你是一个外部检索助手。接到用户查询后，请返回一个JSON数组，数组每项包含 {title, url, snippet}，尽量返回真实来源并以中文简短描述。"
+                            )
+                            messages = [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": f"请基于网络检索以下查询并返回结构化证据（最多{top_k}条）：\n{query}"},
+                            ]
+
+                            resp = client.chat(messages)
+                            text = extract_text(resp) if isinstance(resp, dict) else str(resp)
+
+                            # 尝试解析为 JSON 列表
+                            items = []
+                            try:
+                                import json as _json
+                                parsed = _json.loads(text)
+                                if isinstance(parsed, list):
+                                    items = parsed[:top_k]
+                                elif isinstance(parsed, dict):
+                                    # 支持单个对象包装
+                                    items = [parsed]
+                            except Exception:
+                                # fallback: 按行拆分为若干 snippet
+                                lines = [l.strip() for l in text.splitlines() if l.strip()][:top_k]
+                                items = [{"title": None, "url": None, "snippet": l} for l in lines]
+
+                            now = time()
+                            for idx, it in enumerate(items[:top_k]):
+                                title = it.get("title") if isinstance(it, dict) else None
+                                url = it.get("url") if isinstance(it, dict) else None
+                                snippet = it.get("snippet") if isinstance(it, dict) else str(it)
+                                ev = Evidence(
+                                    evidence_id=f"QF-{app_id}-{int(now)}-{idx}",
+                                    content=snippet or (title or ""),
+                                    source_type="web",
+                                    source_name=f"qianfan_{app_id}",
+                                    source_url=url,
+                                    timestamp=now,
+                                    expiration_days=30,
+                                    status=EvidenceStatus.VERIFIED,
+                                    confidence=ConfidenceLevel.MEDIUM,
+                                    metadata={"reliability_score": 0.6},
+                                )
+                                results.append(ev)
+                        except Exception:
+                            continue
+
+                    # 简单按时间与来源排序
+                    return results[:top_k]
+
             web_retriever = None
+            engine = os.getenv("WEB_ENGINE", "mock").lower()
             if os.getenv("ENABLE_WEB_SEARCH", "false").lower() == "true":
-                web_retriever = WebRetriever(
-                    api_key=os.getenv("SERPER_API_KEY"),
-                    engine=os.getenv("WEB_ENGINE", "mock"),
-                    cache_dir=os.getenv("WEB_CACHE_DIR", "./web_cache"),
-                )
-            
+                if engine == "qianfan":
+                    # 从 experts 配置中获取竞赛侧 agent 的 app_id
+                    try:
+                        comp_agent_names = {"evidence_agent", "feasibility_agent", "risk_agent", "legal_agent"}
+                        app_ids = [str(e.get("app_id")) for e in self.experts if str(e.get("name")) in comp_agent_names and e.get("app_id")]
+                    except Exception:
+                        app_ids = []
+
+                    web_retriever = QianfanWebRetriever(
+                        app_ids=app_ids,
+                        api_key=os.getenv("QIANFAN_API_KEY") or os.getenv("QIANFAN_ACCESS_KEY"),
+                        host=os.getenv("QIANFAN_HOST") or "https://qianfan.baidubce.com",
+                        cache_dir=os.getenv("WEB_CACHE_DIR", "./web_cache"),
+                    )
+                else:
+                    try:
+                        from OPCcomp.web_retriever import WebRetriever
+                        web_retriever = WebRetriever(
+                            api_key=os.getenv("SERPER_API_KEY"),
+                            engine=engine,
+                            cache_dir=os.getenv("WEB_CACHE_DIR", "./web_cache"),
+                        )
+                    except Exception:
+                        web_retriever = None
+
             return EvidenceOrchestrator(
                 kb_retriever=None,
                 info_pool_retriever=lambda q, top_k=3: retrieve_from_info_pool(q, self.info_pool, top_k),
@@ -301,6 +404,75 @@ class DynamicRoutingPipeline:
             "research_result": research_result,
             "research_risk_level": _tier_to_research_risk_level(tier),
         }
+
+    def _invoke_qianfan_agents(self, selected_experts: List[Dict[str, Any]], fused: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """并发调用千帆平台上已注册的 agent（使用 experts 中的 app_id）。返回每个 agent 的原始响应和提取文本。"""
+        try:
+            from .service_client import QianfanAgentClient
+        except Exception:
+            return []
+
+        outputs: List[Dict[str, Any]] = []
+        lock = threading.Lock()
+
+        def call_agent(expert: Dict[str, Any]):
+            app_id = str(expert.get("app_id" or "", "")).strip()
+            if not app_id:
+                return
+            api_key = os.getenv("QIANFAN_API_KEY") or os.getenv("QIANFAN_ACCESS_KEY")
+            secret = os.getenv("QIANFAN_SECRET_KEY") or ""
+            host = os.getenv("QIANFAN_HOST") or "https://qianfan.baidubce.com"
+            client = QianfanAgentClient(app_id=app_id, api_key=api_key or "", secret_key=secret or "", host=host)
+
+            system_prompt = str(expert.get("system_prompt") or "")
+            # 将融合结果作为用户输入传给每个 agent，以便其基于分工生成回复
+            try:
+                user_content = json.dumps(fused, ensure_ascii=False)
+            except Exception:
+                user_content = str(fused)
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ]
+
+            try:
+                resp = client.chat(messages)
+            except Exception as exc:
+                resp = {"ok": False, "status": None, "raw": {"error_message": str(exc)}}
+
+            # 尝试从 raw 中提取常见 content 字段
+            extracted = ""
+            raw = resp.get("raw") if isinstance(resp.get("raw"), dict) else {}
+            try:
+                choices = raw.get("choices", [])
+                if isinstance(choices, list) and choices:
+                    msg = choices[0].get("message") if isinstance(choices[0], dict) else {}
+                    extracted = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            except Exception:
+                extracted = str(raw)
+
+            out = {
+                "expert": expert.get("name"),
+                "app_id": app_id,
+                "ok": resp.get("ok", False),
+                "status": resp.get("status"),
+                "raw": resp.get("raw"),
+                "text": extracted,
+            }
+            with lock:
+                outputs.append(out)
+
+        threads: List[threading.Thread] = []
+        for expert in selected_experts:
+            t = threading.Thread(target=call_agent, args=(expert,))
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        return outputs
 
     def _build_output_attribution(self, remote_called: bool, remote_available: bool) -> Dict[str, Any]:
         return {
@@ -507,6 +679,83 @@ class DynamicRoutingPipeline:
             except Exception:
                 orchestration_result = None
 
+        # 调用千帆平台上注册的各 agent（并发），将每个 agent 的回复收集为 agent_outputs
+        try:
+            agent_outputs = self._invoke_qianfan_agents(selected_experts, fused)
+        except Exception:
+            agent_outputs = []
+
+        # 若远端 agent 返回结果，则使用 multi-agent 路径：规范化 -> pairrank -> fuse
+        if agent_outputs:
+            try:
+                candidates = normalize_agent_outputs(agent_outputs)
+                signals = research_fusion.get("comp_scores") if isinstance(research_fusion, dict) else None
+                ranked_agent = pairrank_from_candidates(candidates, signals)
+                fused_agent = fuse_rule_based(ranked_agent)
+                fused_agent["agent_based"] = True
+                fused_agent["agent_outputs"] = agent_outputs
+
+                # 替换原有的 ranked/fused 输出以反映 agent-based 融合
+                ranked = ranked_agent
+                fused = fused_agent
+            except Exception:
+                # 如果处理失败，保留原有本地融合结果
+                pass
+
+        # === Self-correction integration (optional) ===
+        # If OPCcomp accuracy gate and adapter are available, evaluate fused result
+        # and trigger a single self-correction loop when adapter suggests.
+        try:
+            if AccuracyGate is not None and create_adapter_for_m9 is not None:
+                try:
+                    gate = AccuracyGate()
+                    eval_result = gate.evaluate_router_payload(fused, output_id="router_output")
+                except Exception:
+                    gate = None
+                    eval_result = None
+
+                if gate is not None:
+                    try:
+                        adapter = create_adapter_for_m9(
+                            gate=gate,
+                            service_client=self.client,
+                            orchestrator=self.evidence_orchestrator,
+                            info_pool=self.info_pool,
+                            reference_date=None,
+                        )
+
+                        should = False
+                        try:
+                            should = adapter.should_trigger_correction(eval_result, enable_web_search=True)
+                        except Exception:
+                            should = False
+
+                        if should:
+                            # prepare a textual representation of fused result for correction
+                            try:
+                                fused_text = json.dumps(fused, ensure_ascii=False)
+                            except Exception:
+                                fused_text = str(fused)
+
+                            try:
+                                sc_result = adapter.correct(fused_text, user_text, output_id="router_output")
+                                # attach correction metadata to fused result
+                                fused["self_correction"] = {
+                                    "applied": bool(sc_result.correction_applied),
+                                    "total_iterations": sc_result.total_iterations,
+                                    "final_gate_decision": getattr(sc_result, "final_gate_decision", None).value if getattr(sc_result, "final_gate_decision", None) else None,
+                                    "final_output": sc_result.final_output,
+                                }
+                            except Exception:
+                                # ignore self-correction failures but do not block pipeline
+                                pass
+                    except Exception:
+                        # adapter creation failed; skip self-correction
+                        pass
+        except Exception:
+            # defensive: do not let self-correction errors break main flow
+            pass
+
         remote = None
         remote_called = bool(try_remote_llm)
         if try_remote_llm:
@@ -533,6 +782,7 @@ class DynamicRoutingPipeline:
             "fused_result": fused,
             "evidence_orchestration_result": orchestration_result,
             "remote_llm": remote,
+            "agent_outputs": agent_outputs,
             "output_attribution": self._build_output_attribution(remote_called=remote_called, remote_available=remote is not None),
             "runtime_trace": {
                 "small_model_called": True,
@@ -543,10 +793,22 @@ class DynamicRoutingPipeline:
                 "intent_parse_fallback_score_threshold": self.intent_parse_fallback_score_threshold,
                 "intent_parse_fallback_text_length": self.intent_parse_fallback_text_length,
                 "remote_llm_called": remote_called,
+                "qianfan_called": bool(agent_outputs),
                 "remote_llm_callsite": "pipeline.run -> self.client.chat",
                 "research_fusion_enabled": bool(research_fusion.get("enabled")),
                 "research_fusion_risk_level": research_fusion.get("research_risk_level", ""),
                 "provider": self.provider,
                 "model": self.service_model,
+                # ── 证据管道元数据（供 TypeScript 侧 renderTaskReport 消费 ──
+                "search_triggered": bool(
+                    orchestration_result and getattr(orchestration_result, "search_triggered", False)
+                ) or bool(fused.get("evidence_orchestration_metadata", {}).get("search_triggered", False)),
+                "self_iteration_rounds": int(
+                    fused.get("self_correction", {}).get("total_iterations", 0)
+                    if isinstance(fused.get("self_correction"), dict) else 0
+                ),
+                "kg_contradictions": 0,  # TODO: 接入 KG 矛盾检测后填充实际值
+                "knowledge_graph_hit_count": len(knowledge_graph_hits),
+                "info_pool_hit_count": len(info_hits),
             },
         }

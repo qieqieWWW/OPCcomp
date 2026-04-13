@@ -115,7 +115,6 @@ class SelfCorrectionAdapter:
         output: str,
         query: str,
         output_id: Optional[str] = None,
-        request_type: str = "task",
     ) -> SelfCorrectionResult:
         """
         执行自修正
@@ -124,7 +123,6 @@ class SelfCorrectionAdapter:
             output: 初始输出
             query: 用户查询
             output_id: 输出ID
-            request_type: 请求类型，task 表示任务请求，chat 表示闲聊/非任务请求
             
         Returns:
             SelfCorrectionResult - 包含修正过程和最终结果
@@ -133,7 +131,6 @@ class SelfCorrectionAdapter:
             initial_output=output,
             query=query,
             output_id=output_id,
-            request_type=request_type,
         )
 
     def should_trigger_correction(

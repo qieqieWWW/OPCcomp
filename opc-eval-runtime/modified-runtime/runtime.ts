@@ -23,6 +23,10 @@ interface RuntimeExecutionInput extends BrainRouterOutput {
   bossInstruction?: string;
   boss_instruction?: string;
   instruction?: string;
+  /** 来自 Python pipeline 的知识图谱 / 信息池命中数据，用于生成真实证据 claims */
+  info_pool_hits?: Array<Record<string, unknown>>;
+  /** Python pipeline 的运行时追踪元数据 */
+  runtime_trace?: Record<string, unknown>;
 }
 
 interface RuntimeOptions {
@@ -99,12 +103,21 @@ export class OpenClawRuntime {
     const trace = this.monitor.buildTaskTrace(taskId);
     console.log(`[OpenClawRuntime] [${taskId}] 开始 aggregator.aggregate()...`);
 
+    // 将 Python 侧的真实证据数据（KG命中/信息池）透传给 ResultAggregator
+    const externalEvidence = brainOutput.info_pool_hits ?? [];
+    if (externalEvidence.length > 0) {
+      console.log(`[OpenClawRuntime] [${taskId}] 透传 ${externalEvidence.length} 条真实证据给 ResultAggregator`);
+    } else {
+      console.log(`[OpenClawRuntime] [${taskId}] ⚠️ brainOutput.info_pool_hits 为空（Python pipeline 可能未返回 KG/信息池数据）`);
+    }
+
     return await this.aggregator.aggregate({
       taskPlan,
       brainOutput,
       execution: execution.report,
       outputs: execution.outputs,
       trace,
+      externalEvidence,
     });
   }
 

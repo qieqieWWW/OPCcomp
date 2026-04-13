@@ -24,6 +24,8 @@ export interface ResultAggregationInput {
   execution: ExecutionResult;
   outputs: DepartmentOutput[];
   trace: ExecutionEvent[];
+  /** 来自 Python pipeline 的真实证据数据（KG命中/信息池命中/网络检索） */
+  externalEvidence?: Array<Record<string, unknown>>;
 }
 
 export interface ResultAggregatorConfig {
@@ -149,6 +151,11 @@ export class ResultAggregator {
 
   async aggregate(input: ResultAggregationInput): Promise<AggregatedRuntimeResult> {
     const started = Date.now();
+    // 🔍 诊断：第一时间打印 externalEvidence 传入状态
+    console.log(`[ResultAggregator] aggregate() 入口: externalEvidence 长度=${input.externalEvidence?.length ?? "undefined"}, 类型=${typeof input.externalEvidence}`);
+    if (input.externalEvidence && input.externalEvidence.length > 0) {
+      console.log(`[ResultAggregator] aggregate() externalEvidence[0] keys=[${Object.keys(input.externalEvidence![0]).join(",")}]`, JSON.stringify(input.externalEvidence![0]).slice(0, 200));
+    }
     const cards = input.outputs.map((output) => this.buildCard(output));
     const byDepartment = this.indexOutputs(input.outputs);
     const quality = this.buildQualityAssessment(cards);
@@ -285,11 +292,27 @@ export class ResultAggregator {
       const report = output.report && typeof output.report === "object" ? output.report as Record<string, unknown> : {};
       const executiveSummary = this.pickText(report, ["executiveSummary"]);
       const detailedAnalysis = this.pickText(report, ["detailedAnalysis"]);
+
+      // 截断 LLM 原始长文本，防止中间推理过程泄露到用户侧
+      // executiveSummary 保留首句（通常为结论句），不超过 120 字符
+      const safeExecutive = executiveSummary
+        ? (executiveSummary.length > 120 ? `${executiveSummary.slice(0, 117)}…` : executiveSummary)
+        : this.pickText(output, ["summary", "technicalSummary"]);
+      // detailedAnalysis 仅保留核心判断句，不超过 160 字符
+      const safeAnalysis = detailedAnalysis
+        ? (detailedAnalysis.length > 160 ? `${detailedAnalysis.slice(0, 157)}…` : detailedAnalysis)
+        : null;
       const recommendations = joinList(report.recommendations, 2);
       const nextSteps = joinList(report.nextSteps, 2);
+
+      // 过滤 evidence 字段原始前缀（如 "evidence：基于..." → 直接内容）
+      const cleanPrefix = (text: string): string => {
+        return text.replace(/^(evidence[：:]\s*|证据[：:]\s*)/i, "").trim();
+      };
+
       return [
-        executiveSummary ?? this.pickText(output, ["summary", "technicalSummary"]),
-        detailedAnalysis ? `分析：${detailedAnalysis}` : null,
+        safeExecutive ? cleanPrefix(safeExecutive) : null,
+        safeAnalysis ? `分析：${cleanPrefix(safeAnalysis)}` : null,
         recommendations ? `建议：${recommendations}` : null,
         nextSteps ? `下一步：${nextSteps}` : null,
       ].filter((item): item is string => Boolean(item)).join("；");
@@ -335,6 +358,27 @@ export class ResultAggregator {
       evidenceByDepartment[card.department] = evidenceId;
     }
 
+    // ── 真实证据注入：从 Python pipeline 的 externalEvidence（KG命中/信息池/网络检索）生成证据条目 ──
+    const rawExternalEvidence = input.externalEvidence ?? [];
+    if (rawExternalEvidence.length > 0) {
+      console.log(`[ResultAggregator] 收到 ${rawExternalEvidence.length} 条真实证据数据，开始提取 KG/Web/INFO...`);
+      // 仅日志首条的结构以确认格式（不打印全部内容）
+      const sample = rawExternalEvidence[0];
+      if (sample) {
+        console.log(`[ResultAggregator] 首条样本 keys: [${Object.keys(sample).join(", ")}]`, JSON.stringify(sample).slice(0, 300));
+      }
+    } else {
+      console.log("[ResultAggregator] ⚠️ externalEvidence 为空 — 真实证据未传入，claims 将使用 ExecutiveSummary 兜底");
+    }
+    const kgEvidenceEntries = this.extractKnowledgeGraphEvidence(rawExternalEvidence, collectedAt);
+    const webEvidenceEntries = this.extractWebEvidence(rawExternalEvidence, collectedAt);
+    const infoPoolEntries = this.extractInfoPoolEvidence(rawExternalEvidence, collectedAt);
+
+    // 将真实证据注册到 registry
+    for (const entry of [...kgEvidenceEntries, ...webEvidenceEntries, ...infoPoolEntries]) {
+      evidenceRegistry.push(entry);
+    }
+
     const claims: EvidenceBoundOutput["claims"] = [];
     const primaryEvidenceIds = [
       evidenceByDepartment.evidence,
@@ -342,6 +386,13 @@ export class ResultAggregator {
       evidenceByDepartment.risk,
       evidenceByDepartment.legal,
     ].filter((item): item is string => Boolean(item));
+
+    // 真实证据 ID（用于 claims 关联）
+    const realEvidenceIds = [
+      ...kgEvidenceEntries.map((e) => e.evidence_id),
+      ...webEvidenceEntries.map((e) => e.evidence_id),
+      ...infoPoolEntries.map((e) => e.evidence_id),
+    ];
 
     const addClaim = (payload: {
       text: string;
@@ -366,7 +417,70 @@ export class ResultAggregator {
       });
     };
 
-    if (summary.overview.trim()) {
+    // ── 优先从真实证据数据生成 claims（核心修复：不再仅从 ExecutiveSummary 反推）──
+    if (realEvidenceIds.length > 0) {
+      // 从 KG 命中生成结构化事实声明
+      for (const kgEntry of kgEvidenceEntries.slice(0, 3)) {
+        const meta = kgEntry.metadata as Record<string, unknown> | undefined;
+        const relation = String(meta?.relation ?? meta?.edge_relation ?? "");
+        const sourceLabel = String(meta?.source_label ?? meta?.source_node ?? "");
+        const targetLabel = String(meta?.target_label ?? meta?.target_node ?? "");
+        const snippet = String(kgEntry.snippet ?? "");
+
+        // 构建 KG 格式的事实声明：[KG] 关系 → 来源 → 目标 + 证据片段
+        const factParts = [`[KG] ${relation}`];
+        if (sourceLabel) factParts.push(`${sourceLabel}`);
+        if (targetLabel) factParts.push(`→ ${targetLabel}`);
+        if (snippet) factParts.push(`（${snippet.slice(0, 120)}）`);
+
+        const factText = factParts.filter(Boolean).join(" ");
+        if (factText.length > 10) {
+          addClaim({
+            text: factText,
+            evidence_ids: [kgEntry.evidence_id],
+            confidence: Math.max(0.1, Math.min(0.99, Number(meta?.score ?? 0.8))),
+            scope: "short_term",
+            decision_type: "factual",
+          });
+        }
+      }
+
+      // 从网络检索结果生成引用声明
+      for (const webEntry of webEvidenceEntries.slice(0, 2)) {
+        const meta = webEntry.metadata as Record<string, unknown> | undefined;
+        const title = String(meta?.title ?? "");
+        const url = String(meta?.url ?? webEntry.source ?? "");
+        const snippet = String(webEntry.snippet ?? "").slice(0, 150);
+
+        if (snippet.length > 5) {
+          const refText = url ? `[WEB] ${snippet}${url ? ` — ${url}` : ""}` : `[WEB] ${snippet}`;
+          addClaim({
+            text: refText,
+            evidence_ids: [webEntry.evidence_id],
+            confidence: Number(meta?.reliability === "HIGH" ? 0.85 : meta?.reliability === "MEDIUM" ? 0.7 : 0.55),
+            scope: "short_term",
+            decision_type: "reference",
+          });
+        }
+      }
+
+      // 从信息池命中补充上下文
+      for (const ipEntry of infoPoolEntries.slice(0, 2)) {
+        if (ipEntry && String(ipEntry.snippet ?? "").length > 5) {
+          addClaim({
+            text: `[INFO] ${String(ipEntry.snippet).slice(0, 160)}`,
+            evidence_ids: [ipEntry.evidence_id],
+            confidence: 0.6,
+            scope: "short_term",
+            decision_type: "contextual",
+          });
+        }
+      }
+    }
+
+    // ── 兜底：当没有真实证据时，仍从 ExecutiveSummary 生成综合判断 claims（标记为 estimate）──
+    // 仅在真实证据 claims 数量不足 2 条时补充，且明确标记为聚合判断而非事实
+    if (claims.length < 2 && summary.overview.trim()) {
       addClaim({
         text: summary.overview.trim(),
         evidence_ids: primaryEvidenceIds.slice(0, Math.max(1, primaryEvidenceIds.length)),
@@ -376,7 +490,7 @@ export class ResultAggregator {
       });
     }
 
-    if (summary.businessValue.trim()) {
+    if (realEvidenceIds.length === 0 && summary.businessValue.trim()) {
       addClaim({
         text: summary.businessValue.trim(),
         evidence_ids: [evidenceByDepartment.feasibility, evidenceByDepartment.evidence].filter((item): item is string => Boolean(item)),
@@ -386,7 +500,7 @@ export class ResultAggregator {
       });
     }
 
-    if (summary.riskView.trim()) {
+    if (realEvidenceIds.length === 0 && summary.riskView.trim()) {
       addClaim({
         text: summary.riskView.trim(),
         evidence_ids: [evidenceByDepartment.risk, evidenceByDepartment.legal].filter((item): item is string => Boolean(item)),
@@ -396,7 +510,7 @@ export class ResultAggregator {
       });
     }
 
-    if (summary.nextStep.trim()) {
+    if (realEvidenceIds.length === 0 && summary.nextStep.trim()) {
       addClaim({
         text: summary.nextStep.trim(),
         evidence_ids: [evidenceByDepartment.legal, evidenceByDepartment.risk, evidenceByDepartment.feasibility].filter((item): item is string => Boolean(item)),
@@ -475,6 +589,140 @@ export class ResultAggregator {
         degrade_reason: degradeReason,
       },
     };
+  }
+
+  // ── 真实证据提取方法（从 Python pipeline 传入的 externalEvidence 中解析）──
+
+  /**
+   * 从 externalEvidence 中提取知识图谱命中条目。
+   * Python 侧 GraphHit.to_dict() 格式: { score, edge: {source, target, relation, keywords, evidence_snippet}, source_node, target_node, ... }
+   */
+  private extractKnowledgeGraphEvidence(
+    raw: Array<Record<string, unknown>>,
+    collectedAt: string,
+  ): EvidenceBoundOutput["evidence_registry"] {
+    const entries: EvidenceBoundOutput["evidence_registry"] = [];
+    for (const item of raw) {
+      // KG 命中特征检测：有 edge 对象（包含 source/target/relation）或 graph_id 字段
+      const hasEdge = item.edge && typeof item.edge === "object";
+      const hasGraphId = typeof item.graph_id === "string" || typeof item.graphId === "string";
+      if (!hasEdge && !hasGraphId) continue;
+
+      const edge = (item.edge ?? {}) as Record<string, unknown>;
+      const relation = String(edge.relation ?? "").trim();
+      const evidenceSnippet = String(edge.evidence_snippet ?? edge.evidenceSnippet ?? item.evidence_snippet ?? "").trim();
+      const sourceNode = item.source_node as Record<string, unknown> | undefined;
+      const targetNode = item.target_node as Record<string, unknown> | undefined;
+      const score = typeof item.score === "number" ? item.score : 0.8;
+
+      if (!relation && !evidenceSnippet) continue;
+
+      const entry: EvidenceBoundOutput["evidence_registry"][number] = {
+        evidence_id: this.buildEvidenceId("knowledge_graph", `graph:${item.graph_id ?? item.graphId ?? "kg-v2"}`, `${relation}|${evidenceSnippet}|${score}`, collectedAt),
+        evidence_type: "knowledge_graph",
+        source: String(item.graph_id ?? item.graphId ?? "kg-v2"),
+        source_label: relation
+          ? `[KG] ${relation}${sourceNode ? ` (${String(sourceNode.label ?? sourceNode.id ?? "")})` : ""}`
+          : "知识图谱命中",
+        collected_at: collectedAt,
+        freshness_ttl_hours: 168, // KG 数据通常比部门输出更稳定，7天 TTL
+        snippet: evidenceSnippet || `${relation}: ${String(sourceNode?.label ?? "")} → ${String(targetNode?.label ?? "")}`,
+        checksum: hashText(`${relation}|${evidenceSnippet}`),
+        metadata: {
+          score,
+          relation,
+          source_node: String(sourceNode?.label ?? sourceNode?.id ?? ""),
+          target_node: String(targetNode?.label ?? targetNode?.id ?? ""),
+          edge_keywords: Array.isArray(edge.keywords) ? edge.keywords : [],
+          match_reason: String(item.match_reason ?? ""),
+          // 保留原始 edge 数据供渲染层使用
+          edge_source: String(edge.source ?? ""),
+          edge_target: String(edge.target ?? ""),
+        },
+      };
+      entries.push(entry);
+    }
+    return entries;
+  }
+
+  /**
+   * 从 externalEvidence 中提取网络检索证据。
+   * Python 侧 WebEvidence 格式: { evidence_id, url, title, snippet, publish_date, freshness_score, source_reliability }
+   */
+  private extractWebEvidence(
+    raw: Array<Record<string, unknown>>,
+    collectedAt: string,
+  ): EvidenceBoundOutput["evidence_registry"] {
+    const entries: EvidenceBoundOutput["evidence_registry"] = [];
+    for (const item of raw) {
+      // Web 检索特征检测：有 url 字段且以 http 开头
+      const url = String(item.url ?? "");
+      if (!url.startsWith("http")) continue;
+
+      const title = String(item.title ?? "").trim();
+      const snippet = String(item.snippet ?? "").trim();
+      const reliability = String(item.source_reliability ?? item.sourceReliability ?? item.reliability ?? "MEDIUM").toUpperCase();
+
+      if (!snippet && !title) continue;
+
+      entries.push({
+        evidence_id: this.buildEvidenceId("web", url, `${title}|${snippet}`, collectedAt),
+        evidence_type: "web",
+        source: url,
+        source_label: `[WEB] ${title || new URL(url).hostname}`,
+        collected_at: collectedAt,
+        freshness_ttl_hours: 24, // 网络数据 24h TTL
+        snippet: snippet || title,
+        checksum: hashText(`${url}|${snippet}`),
+        metadata: {
+          url,
+          title,
+          reliability,
+          publish_date: String(item.publish_date ?? item.publishDate ?? ""),
+          freshness_score: typeof item.freshness_score === "number" ? item.freshness_score : undefined,
+        },
+      });
+    }
+    return entries;
+  }
+
+  /**
+   * 从 externalEvidence 中提取信息池命中（非KG、非Web的通用信息）。
+   */
+  private extractInfoPoolEvidence(
+    raw: Array<Record<string, unknown>>,
+    collectedAt: string,
+  ): EvidenceBoundOutput["evidence_registry"] {
+    const entries: EvidenceBoundOutput["evidence_registry"] = [];
+    for (const item of raw) {
+      // 跳过已被 KG 和 Web 提取器处理的条目
+      const hasEdge = item.edge && typeof item.edge === "object";
+      const hasGraphId = typeof item.graph_id === "string" || typeof item.graphId === "string";
+      const url = String(item.url ?? "");
+      if (hasEdge || hasGraphId || url.startsWith("http")) continue;
+
+      // 信息池特征：有 text / snippet / content 字段
+      const text = String(item.text ?? item.snippet ?? item.content ?? item.summary ?? "").trim();
+      const sourceLabel = String(item.source ?? item.source_label ?? item.name ?? "info_pool");
+
+      if (!text || text.length < 5) continue;
+
+      entries.push({
+        evidence_id: this.buildEvidenceId("info_pool", sourceLabel, text.slice(0, 200), collectedAt),
+        evidence_type: "info_pool",
+        source: sourceLabel,
+        source_label: `[INFO] ${sourceLabel}`,
+        collected_at: collectedAt,
+        freshness_ttl_hours: 48,
+        snippet: text.slice(0, 200),
+        checksum: hashText(text.slice(0, 200)),
+        metadata: {
+          category: String(item.category ?? item.type ?? "general"),
+          relevance: typeof item.relevance === "number" ? item.relevance : undefined,
+        },
+      });
+    }
+    return entries;
   }
 
   private buildEvidenceId(evidenceType: EvidenceBoundOutput["evidence_registry"][number]["evidence_type"], source: string, snippet: string, collectedAt: string): string {

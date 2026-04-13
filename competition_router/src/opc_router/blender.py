@@ -43,6 +43,53 @@ def pairrank(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [item[1] for item in ranked]
 
 
+def normalize_agent_outputs(agent_outputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """将来自各个远端 agent 的原始输出规范化为 pairrank/fuser 可接受的 candidate 格式。
+
+    每个 candidate 至少包含：
+    - expert: {name: str}
+    - parsed: {risk_summary, actions, alerts, grounding}
+    - raw: 原始响应
+    - evidence: 可选的证据列表
+    """
+    candidates: List[Dict[str, Any]] = []
+    for out in agent_outputs or []:
+        name = out.get("expert") or out.get("agent") or "unknown"
+        text = out.get("text") or ""
+        raw = out.get("raw") or {}
+        evidence = []
+        # 常见位置查找 evidence-like 字段
+        if isinstance(raw, dict):
+            if raw.get("evidence"):
+                evidence = raw.get("evidence")
+            elif raw.get("evidences"):
+                evidence = raw.get("evidences")
+            elif raw.get("external_evidence"):
+                evidence = raw.get("external_evidence")
+
+        parsed = {
+            "risk_summary": (text or "").strip(),
+            "actions": [],
+            "alerts": [],
+            "grounding": []
+        }
+
+        candidate = {
+            "expert": {"name": name},
+            "parsed": parsed,
+            "raw": raw,
+            "evidence": evidence,
+        }
+        candidates.append(candidate)
+    return candidates
+
+
+def pairrank_from_candidates(candidates: List[Dict[str, Any]], signals: Dict[str, float] | None = None) -> List[Dict[str, Any]]:
+    """Wrapper to run pairrank on normalized candidates. Signals may be used in future to adjust scoring."""
+    # For now ignore signals and use existing pairrank
+    return pairrank(candidates)
+
+
 def fuse_rule_based(ranked: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not ranked:
         return {

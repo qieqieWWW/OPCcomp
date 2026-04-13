@@ -6,32 +6,9 @@ import { randomUUID } from "crypto";
 import * as path from "path";
 import { OpenClawRuntime } from "../runtime";
 
-const WebSocket = require("ws") as typeof import("ws");
-type RawData = import("ws").RawData;
-
 type ExecuteRequestBody = {
   input?: unknown;
   openId?: unknown;
-};
-
-type RuntimeRelayExecuteRequest = {
-  type: "execute_request";
-  requestId: string;
-  input: string;
-  openId: string;
-};
-
-type RuntimeRelayExecuteResponse = {
-  type: "execute_response";
-  requestId: string;
-  response: RuntimeExecuteResponse;
-};
-
-type RuntimeRelayRegisterMessage = {
-  type: "register";
-  role: "runtime-worker";
-  clientId: string;
-  version: string;
 };
 
 type CollaborationEdge = {
@@ -69,21 +46,6 @@ type OpcRouteResponse = {
   message?: string;
 };
 
-type RuntimeExecutionPayload = {
-  ok: true;
-  taskId: string;
-  result: string;
-  succeeded: unknown;
-  failed: unknown;
-  execution_trace: Record<string, unknown>;
-};
-
-type RuntimeExecuteResponse = RuntimeExecutionPayload | {
-  ok: false;
-  error: string;
-  message?: string;
-};
-
 class OpcUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -100,13 +62,8 @@ const OPC_ROUTER_URL = process.env.OPC_ROUTER_URL ?? "http://127.0.0.1:18081/rou
 const OPC_ROUTER_TIMEOUT_MS = Number(process.env.OPC_ROUTER_TIMEOUT_MS ?? "90000");
 // 默认关闭远程 LLM 摘要，避免 /route 额外 60s+ 开销导致端到端超时。
 const OPC_ROUTER_TRY_REMOTE_LLM = String(process.env.OPC_ROUTER_TRY_REMOTE_LLM ?? "false").toLowerCase() === "true";
-const RUNTIME_RELAY_URL = process.env.RUNTIME_RELAY_URL ?? "";
-const RUNTIME_RELAY_TOKEN = process.env.RUNTIME_RELAY_TOKEN ?? "";
-const RUNTIME_RELAY_CLIENT_ID = process.env.RUNTIME_RELAY_CLIENT_ID ?? `runtime-worker-${process.pid}`;
 
 const runtime = new OpenClawRuntime();
-let relaySocket: InstanceType<typeof WebSocket> | null = null;
-let relayReconnectTimer: NodeJS.Timeout | null = null;
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -131,8 +88,86 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const payload = await executeRuntimePipeline(input, openId);
-      return sendJson(res, 200, payload);
+      const opcResult = await getRoutingFromOpcService(input);
+      const intent = normalizeIntent(opcResult.intent);
+
+      if (intent.type !== "task_request") {
+        return sendJson(res, 200, {
+          ok: true,
+          taskId: `chat-${Date.now()}`,
+          result: buildConversationReply(opcResult, input),
+          succeeded: [],
+          failed: [],
+          intent,
+        });
+      }
+
+      const taskId = `long-${Date.now()}-${randomUUID().slice(0, 8)}`;
+      // eslint-disable-next-line no-console
+      console.log(`[runtime-execute] [${taskId}] 收到执行请求，openId=${openId || "unknown"}, input="${input.slice(0, 80)}..."`);
+
+      const selectedExperts = normalizeSelectedExperts(opcResult.selected_experts);
+      const expertsForExecution = selectedExperts.length > 0
+        ? selectedExperts
+        : buildDefaultExperts();
+      // eslint-disable-next-line no-console
+      console.log(`[runtime-execute] [${taskId}] OPC 路由完成，experts=${expertsForExecution.map((e) => String(e.name ?? "")).join(",")}, tier=${opcResult.small_model?.tier ?? "?"}`);
+      // eslint-disable-next-line no-console
+      console.log(`[runtime-execute] [${taskId}] 开始调用 runtime.execute()...`);
+
+      if (selectedExperts.length === 0) {
+        // eslint-disable-next-line no-console
+        console.warn(`[runtime-execute] [${taskId}] router returned empty selected_experts, fallback to default experts`);
+      }
+
+      const collaborationEdges = normalizeEdges(opcResult.collaboration_plan?.edges);
+      // eslint-disable-next-line no-console
+      console.log(`[runtime-execute] [${taskId}] 协作依赖边（过滤后）: ${collaborationEdges.map((e) => `${e.from}->${e.to}`).join(", ") || "(无)"}`);
+      const tier = normalizeTier(opcResult.small_model?.tier);
+
+      // 合并 info_pool_hits 与 knowledge_graph_hits，统一作为证据命中传递
+      const allHits = [
+        ...(opcResult.info_pool_hits ?? []),
+        ...(opcResult.knowledge_graph_hits ?? []),
+      ];
+      if (allHits.length > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[runtime-execute] [${taskId}] 聚合命中数据：${opcResult.info_pool_hits?.length ?? 0} info_pool + ${opcResult.knowledge_graph_hits?.length ?? 0} knowledge_graph = ${allHits.length} total`);
+        // eslint-disable-next-line no-console
+        console.log(`[runtime-execute] [${taskId}] 首条 hit 样本:`, JSON.stringify(allHits[0]).slice(0, 300));
+      } else {
+        // eslint-disable-next-line no-console
+        console.log(`[runtime-execute] [${taskId}] ⚠️ allHits 为空 — info_pool_hits=${opcResult.info_pool_hits?.length ?? 0}, knowledge_graph_hits=${opcResult.knowledge_graph_hits?.length ?? 0}`);
+      }
+
+      const result = await runtime.execute({
+        taskId,
+        bossInstruction: input,
+        small_model: { tier },
+        selected_experts: expertsForExecution,
+        collaboration_plan: { edges: collaborationEdges },
+        info_pool_hits: allHits,
+        output_attribution: {
+          ...(opcResult.output_attribution ?? {}),
+          source: "competition-router+runtime-execute-server",
+        },
+        runtime_trace: {
+          ...(opcResult.runtime_trace ?? {}),
+          source: "competition-router+runtime-execute-server",
+          openId: openId || "unknown",
+        },
+      });
+
+      logRuntimeExecutionTrace(taskId, result);
+
+      return sendJson(res, 200, {
+        ok: true,
+        taskId: result.taskId,
+        result: buildReplyText(result, opcResult),
+        succeeded: result.succeeded,
+        failed: result.failed,
+        execution_trace: summarizeExecutionTrace(result),
+      });
     } catch (error) {
       if (error instanceof OpcUnavailableError) {
         return sendJson(res, 503, {
@@ -161,171 +196,7 @@ server.listen(RUNTIME_PORT, RUNTIME_HOST, () => {
   console.log(`[runtime-execute] listening on http://${RUNTIME_HOST}:${RUNTIME_PORT}`);
   // eslint-disable-next-line no-console
   console.log("[runtime-execute] execute path: POST /execute");
-  startRuntimeRelayClient();
 });
-
-async function executeRuntimePipeline(input: string, openId: string): Promise<RuntimeExecuteResponse> {
-  const opcResult = await getRoutingFromOpcService(input);
-  const intent = normalizeIntent(opcResult.intent);
-
-  if (intent.type !== "task_request") {
-    return {
-      ok: true,
-      taskId: `chat-${Date.now()}`,
-      result: buildConversationReply(opcResult, input),
-      succeeded: [],
-      failed: [],
-      execution_trace: {
-        intent,
-        source: "competition-router+runtime-execute-server",
-      },
-    };
-  }
-
-  const taskId = `long-${Date.now()}-${randomUUID().slice(0, 8)}`;
-  // eslint-disable-next-line no-console
-  console.log(`[runtime-execute] [${taskId}] 收到执行请求，openId=${openId || "unknown"}, input="${input.slice(0, 80)}..."`);
-
-  const selectedExperts = normalizeSelectedExperts(opcResult.selected_experts);
-  const expertsForExecution = selectedExperts.length > 0
-    ? selectedExperts
-    : buildDefaultExperts();
-  // eslint-disable-next-line no-console
-  console.log(`[runtime-execute] [${taskId}] OPC 路由完成，experts=${expertsForExecution.map((e) => String(e.name ?? "")).join(",")}, tier=${opcResult.small_model?.tier ?? "?"}`);
-  // eslint-disable-next-line no-console
-  console.log(`[runtime-execute] [${taskId}] 开始调用 runtime.execute()...`);
-
-  if (selectedExperts.length === 0) {
-    // eslint-disable-next-line no-console
-    console.warn(`[runtime-execute] [${taskId}] router returned empty selected_experts, fallback to default experts`);
-  }
-
-  const collaborationEdges = normalizeEdges(opcResult.collaboration_plan?.edges);
-  // eslint-disable-next-line no-console
-  console.log(`[runtime-execute] [${taskId}] 协作依赖边（过滤后）: ${collaborationEdges.map((e) => `${e.from}->${e.to}`).join(", ") || "(无)"}`);
-  const tier = normalizeTier(opcResult.small_model?.tier);
-
-  // 合并 info_pool_hits 与 knowledge_graph_hits，统一作为证据命中传递
-  const allHits = [
-    ...(opcResult.info_pool_hits ?? []),
-    ...(opcResult.knowledge_graph_hits ?? []),
-  ];
-  if (allHits.length > 0) {
-    // eslint-disable-next-line no-console
-    console.log(`[runtime-execute] [${taskId}] 聚合命中数据：${opcResult.info_pool_hits?.length ?? 0} info_pool + ${opcResult.knowledge_graph_hits?.length ?? 0} knowledge_graph = ${allHits.length} total`);
-  }
-
-  const result = await runtime.execute({
-    taskId,
-    bossInstruction: input,
-    small_model: { tier },
-    selected_experts: expertsForExecution,
-    collaboration_plan: { edges: collaborationEdges },
-    info_pool_hits: allHits,
-    output_attribution: {
-      ...(opcResult.output_attribution ?? {}),
-      source: "competition-router+runtime-execute-server",
-    },
-    runtime_trace: {
-      ...(opcResult.runtime_trace ?? {}),
-      source: "competition-router+runtime-execute-server",
-      openId: openId || "unknown",
-    },
-  });
-
-  logRuntimeExecutionTrace(taskId, result);
-
-  return {
-    ok: true,
-    taskId: result.taskId,
-    result: buildReplyText(result),
-    succeeded: result.succeeded,
-    failed: result.failed,
-    execution_trace: summarizeExecutionTrace(result),
-  };
-}
-
-function startRuntimeRelayClient(): void {
-  if (!RUNTIME_RELAY_URL) {
-    // eslint-disable-next-line no-console
-    console.log("[runtime-execute] RUNTIME_RELAY_URL 未配置，保持 HTTP 模式。");
-    return;
-  }
-
-  const connect = (): void => {
-    const relayUrl = buildRelayUrl(RUNTIME_RELAY_URL, RUNTIME_RELAY_TOKEN);
-    // eslint-disable-next-line no-console
-    console.log(`[runtime-execute] connecting relay: ${relayUrl.replace(/token=[^&]+/i, "token=***")}`);
-    const socket = new WebSocket(relayUrl);
-    relaySocket = socket;
-
-    socket.on("open", () => {
-      const registerMessage: RuntimeRelayRegisterMessage = {
-        type: "register",
-        role: "runtime-worker",
-        clientId: RUNTIME_RELAY_CLIENT_ID,
-        version: "1",
-      };
-      socket.send(JSON.stringify(registerMessage));
-      // eslint-disable-next-line no-console
-      console.log(`[runtime-execute] relay connected as ${RUNTIME_RELAY_CLIENT_ID}`);
-    });
-
-    socket.on("message", async (data: RawData) => {
-      try {
-        const text = typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8") : Buffer.from(data as ArrayBuffer).toString("utf8");
-        const message = JSON.parse(text) as Partial<RuntimeRelayExecuteRequest> & { type?: string; requestId?: string; input?: string; openId?: string };
-        if (message.type !== "execute_request" || typeof message.requestId !== "string") {
-          return;
-        }
-        const input = typeof message.input === "string" ? message.input : "";
-        const openId = typeof message.openId === "string" ? message.openId : "";
-        const response = await executeRuntimePipeline(input, openId);
-        const relayResponse: RuntimeRelayExecuteResponse = {
-          type: "execute_response",
-          requestId: message.requestId,
-          response,
-        };
-        socket.send(JSON.stringify(relayResponse));
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.error("[runtime-execute] relay message handling failed", error);
-      }
-    });
-
-    socket.on("close", () => {
-      relaySocket = null;
-      // eslint-disable-next-line no-console
-      console.warn("[runtime-execute] relay disconnected, scheduling reconnect...");
-      if (relayReconnectTimer) {
-        clearTimeout(relayReconnectTimer);
-      }
-      relayReconnectTimer = setTimeout(connect, 3000);
-    });
-
-    socket.on("error", (error: Error) => {
-      // eslint-disable-next-line no-console
-      console.error("[runtime-execute] relay websocket error", error);
-      try {
-        socket.close();
-      } catch {
-        // ignore
-      }
-    });
-  };
-
-  connect();
-}
-
-function buildRelayUrl(baseUrl: string, token: string): string {
-  if (!token) {
-    return baseUrl;
-  }
-
-  const url = new URL(baseUrl);
-  url.searchParams.set("token", token);
-  return url.toString();
-}
 
 function buildReplyText(result: {
   taskId: string;
@@ -363,7 +234,7 @@ function buildReplyText(result: {
   };
   departmentOutputs?: Array<{ department?: string; summary?: string }>;
   fusedResult?: { fusedContent?: string } | null;
-}): string {
+}, opcContext?: OpcRouteResponse): string {
   logEvidenceMetadata(result.taskId, result.evidenceBoundOutput);
 
   const evidenceBoundOutput = result.evidenceBoundOutput;
@@ -390,7 +261,7 @@ function buildReplyText(result: {
     return "FAULT_CODE:EVIDENCE_CONFLICT";
   }
 
-  const taskReport = renderTaskReport(result);
+  const taskReport = renderTaskReport(result, opcContext);
   if (taskReport) {
     return taskReport;
   }
@@ -547,11 +418,34 @@ function renderTaskReport(result: {
   };
   departmentOutputs?: Array<{ department?: string; summary?: string }>;
   fusedResult?: { fusedContent?: string } | null;
-}): string {
+}, opcContext?: OpcRouteResponse): string {
   const summary = result.executiveSummary ?? {};
   const evidenceBoundOutput = result.evidenceBoundOutput ?? {};
   const hasConflict = Array.isArray(evidenceBoundOutput.conflicts) && evidenceBoundOutput.conflicts.length > 0;
 
+  // ── 准确性系统元数据提取（用于证据锚点中的系统工作状态展示）──
+  const kgHitCount = Array.isArray(opcContext?.knowledge_graph_hits) ? opcContext.knowledge_graph_hits.length : 0;
+  const infoPoolCount = Array.isArray(opcContext?.info_pool_hits) ? opcContext.info_pool_hits.length : 0;
+  const runtimeTrace = opcContext?.runtime_trace as Record<string, unknown> ?? {};
+  const searchTriggered = Boolean(runtimeTrace?.search_triggered) || Boolean(runtimeTrace?.web_retriever_used);
+  const selfIterationRounds = Number(runtimeTrace?.self_iteration_rounds ?? 0);
+  const kgContradictions = Number(runtimeTrace?.kg_contradictions ?? 0);
+
+  // 构建系统工作状态行（仅在有任何系统活动时才展示）
+  const systemStatusParts: string[] = [];
+  if (kgHitCount > 0) systemStatusParts.push(`知识图谱命中 ${kgHitCount} 条`);
+  if (searchTriggered) systemStatusParts.push("互联网检索增强已启用");
+  if (selfIterationRounds > 0) systemStatusParts.push(`自我修正 ${selfIterationRounds} 轮`);
+  if (kgContradictions > 0) systemStatusParts.push(`图谱矛盾检测发现 ${kgContradictions} 处`);
+  // info_pool_hits 是通用信息池命中（非KG非检索），有数据时也标注
+  if (infoPoolCount > 0 && kgHitCount === 0 && !searchTriggered) {
+    systemStatusParts.push(`信息池命中 ${infoPoolCount} 条`);
+  }
+  const systemStatusLine = systemStatusParts.length > 0
+    ? `📊 系统工作状态：${systemStatusParts.join("，")}。`
+    : "";
+
+  // ── 各章节原始数据准备 ──
   const quickConclusionRaw = hasConflict
     ? null
     : normalizeText(summary.overview ?? result.summary ?? result.fusedResult?.fusedContent, 520);
@@ -572,7 +466,20 @@ function renderTaskReport(result: {
   const claims = Array.isArray(evidenceBoundOutput.claims)
     ? dedupeSemanticLines(
         evidenceBoundOutput.claims
-          .map((item) => normalizeText(item.text, 420))
+          .map((item) => {
+            const text = normalizeText(item.text, 420);
+            if (!text) return null;
+            const decisionType = String(item.decision_type ?? "estimate");
+            // 真实证据前缀标注：让用户一眼区分事实声明与聚合判断
+            const prefix = decisionType === "factual"
+              ? "🔍 "
+              : decisionType === "reference"
+                ? "📎 "
+                : decisionType === "contextual"
+                  ? "📋 "
+                  : ""; // estimate 类型不加前缀，保持原有格式
+            return `${prefix}${text}`;
+          })
           .filter((item): item is string => Boolean(item))
           .map(cleanReportText),
       )
@@ -613,15 +520,18 @@ function renderTaskReport(result: {
       )
     : [];
 
+  // 分部门摘要：截断过长文本（修复 LLM 原始输出泄露）
   const departmentSummaries = Array.isArray(result.departmentOutputs)
     ? dedupeSemanticLines(
         result.departmentOutputs
           .map((item) => {
             const name = formatDepartmentName(item.department);
-            const text = normalizeText(item.summary, 360);
-            if (!name || !text) {
+            const rawText = normalizeText(item.summary, 360);
+            if (!name || !rawText) {
               return null;
             }
+            // 截断到 200 字符，避免 LLM 原始长段落泄露
+            const text = rawText.length > 200 ? `${rawText.slice(0, 197)}…` : rawText;
             return `${name}：${text}`;
           })
           .filter((item): item is string => Boolean(item))
@@ -629,39 +539,45 @@ function renderTaskReport(result: {
       )
     : [];
 
-  const allEvidenceText = [quickConclusion ?? "", businessValue, riskView, ...claims, ...highlights, ...departmentSummaries]
-    .filter(Boolean)
-    .join("\n");
-  const consistencyNote = buildConsistencyNote(allEvidenceText);
+  // ── 章节职责分离：每章只承载独特信息，不跨章重复 ──
 
   const sections: string[] = [];
   const intro = "以下按证据优先报告体整理，先给证据再给结论与动作。";
 
-  const evidenceLines = claims.slice(0, 6);
-  if (evidenceLines.length > 0) {
-    sections.push(`一、证据锚点\n${evidenceLines.map((item) => `- ${item}`).join("\n")}`);
+  // 【一、证据锚点】系统工作状态 + claims（来自证据编排器的结构化声明）
+  // 让用户先看到"系统做了哪些工作" + "我们掌握了哪些事实"
+  const evidenceAnchors: string[] = [];
+  if (systemStatusLine) evidenceAnchors.push(systemStatusLine);
+  evidenceAnchors.push(...claims.slice(0, 5).map((item) => `- ${item}`));
+  if (evidenceAnchors.length > 0) {
+    sections.push(`一、证据锚点\n${evidenceAnchors.join("\n")}`);
   }
 
+  // 【二、快速结论】仅一句话判断 + 可行性/风险摘要
+  // 不重复 claims 内容，不展开细节
   if (quickConclusion) {
     sections.push(`二、快速结论\n${quickConclusion}`);
   } else if (hasConflict) {
     sections.push("二、快速结论\n- 当前证据存在冲突，暂不输出单一确定性判断。请先按下方处理建议补充验证。");
   }
 
-  const coreFindings = dedupeSemanticLines([
-    ...(businessValue ? [`业务判断：${businessValue}`] : []),
-    ...highlights.slice(0, 4),
-    ...claims.slice(0, 4),
-    ...(consistencyNote ? [consistencyNote] : []),
-  ]);
+  // 【三、关键发现】仅 highlights 中非评分类的独特发现
+  // 核心修复：去除 claims 重复 + 去除与快速结论雷同的评分条目
+  const scorePattern = /评分\s*\d+\s*\/\s*100|建议\s*(推进|谨慎|暂停)/;
+  const uniqueHighlights = highlights
+    .filter((h) => !scorePattern.test(h))  // 去掉"可行性评分 XX/100"等已在快速结论出现的内容
+    .slice(0, 5);
+  const coreFindings = dedupeSemanticLines(uniqueHighlights);
   if (coreFindings.length > 0) {
     sections.push(`三、关键发现\n${coreFindings.map((item) => `- ${item}`).join("\n")}`);
   }
 
+  // 【四、分部门分析】各部门精炼摘要（已在上层截断到 200 字符）
   if (departmentSummaries.length > 0) {
     sections.push(`四、分部门分析\n${departmentSummaries.map((item) => `- ${item}`).join("\n")}`);
   }
 
+  // 【五、风险与不确定性】风险视图 + 冲突项
   const riskLines = dedupeSemanticLines([
     ...(riskView ? [riskView] : []),
     ...conflicts.slice(0, 4),
@@ -670,8 +586,9 @@ function renderTaskReport(result: {
     sections.push(`五、风险与不确定性\n${riskLines.map((item) => `- ${item}`).join("\n")}`);
   }
 
+  // 【六、建议与下一步】动作项 + 执行细化（不再过度展开）
   const nextActions = dedupeSemanticLines([
-    ...(nextStep ? [expandActionLine(nextStep)] : []),
+    ...(nextStep ? [nextStep] : []),  // 不再对 nextStep 调用 expandActionLine 避免过度展开
     ...actions.slice(0, 4),
   ]);
   if (nextActions.length > 0) {
@@ -705,7 +622,7 @@ function logEvidenceMetadata(taskId: string, evidenceBoundOutput?: {
   const claims = Array.isArray(evidenceBoundOutput.claims)
     ? evidenceBoundOutput.claims.map((item) => ({
         claim_id: normalizeText(item.claim_id, 40) ?? "",
-        decision_type: normalizeText(item.decision_type, 30) ?? "",
+        decision_type: normalizeText(item.decision_type, 30) ?? "estimate",
         confidence: typeof item.confidence === "number" ? Math.round(item.confidence * 100) : undefined,
         evidence_ids: Array.isArray(item.evidence_ids)
           ? item.evidence_ids.map((id) => normalizeText(id, 40)).filter((id): id is string => Boolean(id))
@@ -816,12 +733,13 @@ function buildConsistencyNote(allText: string): string {
 function expandActionLine(line: string): string {
   const text = cleanReportText(line);
 
+  // 仅做轻量级执行提示，不再生成大段展开文本
   if (/市场调研|竞品|需求验证/i.test(text)) {
-    return `${text}（执行细化：48小时内完成Top5竞品价格/卖点矩阵，72小时内补齐20份目标用户访谈摘要与渠道转化假设，输出一页定价与定位修订表）`;
+    return `${text}（建议48h内完成竞品分析）`;
   }
 
   if (/Arduino|许可证|开源许可|知识产权/i.test(text)) {
-    return `${text}（执行细化：建立依赖清单SBOM，逐项核对GPL/MIT/Apache许可义务，完成数据库来源授权凭证归档与法务复核）`;
+    return `${text}（建议建立SBOM依赖清单）`;
   }
 
   return text;

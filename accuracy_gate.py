@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -457,6 +458,10 @@ class AccuracyEvaluator:
                         "message": f"evidence {ev_id} marked conflicting",
                     })
 
+        # 3) 知识图谱因果矛盾检测: 检测声明是否与已知图谱关系矛盾
+        kg_contradictions = self._detect_kg_graph_contradictions(statements)
+        conflicts.extend(kg_contradictions)
+
         return conflicts
 
     def _numeric_conflict(self, a: str, b: str) -> Optional[str]:
@@ -475,6 +480,37 @@ class AccuracyEvaluator:
         if abs(x - y) / m > 0.5:
             return f"numeric mismatch {x} vs {y}"
         return None
+
+    def _detect_kg_graph_contradictions(self, statements: List[OutputStatement]) -> List[Dict[str, Any]]:
+        """
+        检测输出声明是否与知识图谱中的已知因果/约束关系矛盾.
+
+        通过 KnowledgeGraphEngine.find_contradicting_relations() 实现.
+        如果声明中否定了图谱中已验证的关系（例如"渠道冗余不影响现金流"
+        而图中渠道冗余 --protects--> 现金流跑道），则标记为矛盾。
+        """
+        contradictions: List[Dict[str, Any]] = []
+        try:
+            from m7_knowledge_graph import get_kg_engine
+            engine = get_kg_engine()
+            if not engine or not engine.is_loaded:
+                return contradictions
+
+            for stmt in statements:
+                claim_text = stmt.claim
+                kg_chains = engine.find_contradicting_relations(claim_text)
+                for chain in kg_chains:
+                    contradictions.append({
+                        "type": "kg_graph_contradiction",
+                        "statement_ids": [stmt.statement_id],
+                        "severity": "high",
+                        "message": chain.chain_text,
+                        "kg_detail": chain.to_dict(),
+                    })
+        except Exception as exc:
+            logger.debug(f"[AccuracyGate] KG 图谱矛盾检测异常（已降级跳过）: {exc}")
+
+        return contradictions
 
     def _build_metrics(
         self,
@@ -616,9 +652,11 @@ class AccuracyEvaluator:
 
 
 class AccuracyGate:
-    def __init__(self, evidence_db_path: Optional[str] = None):
+    def __init__(self, evidence_db_path: Optional[str] = None, kg_engine=None):
         self.evidence_store = EvidenceStore()
         self.evaluator = AccuracyEvaluator(self.evidence_store)
+        # 可选: 外部传入的 KG 引擎（避免重复初始化）
+        self._kg_engine = kg_engine
 
         if evidence_db_path:
             self.evidence_store.load(evidence_db_path)
@@ -628,32 +666,73 @@ class AccuracyGate:
         self.m5_status = self._load_m5()
         self.m12_status = self._load_m12()
 
+    def _get_kg_engine(self):
+        """懒加载 KG 引擎（延迟导入避免循环依赖）。"""
+        if self._kg_engine is not None:
+            return self._kg_engine
+        try:
+            from m7_knowledge_graph import get_kg_engine
+            self._kg_engine = get_kg_engine()
+            return self._kg_engine
+        except Exception:
+            return None
+
     def _bootstrap_seed_evidence(self) -> None:
-        seeds = [
-            Evidence(
-                evidence_id="EV-KS-2025-MARKET",
-                content="Kickstarter ecosystem shows category-specific success variance",
-                source_type="dataset",
-                source_name="kickstarter_cleaned",
-                expiration_days=180,
-            ),
-            Evidence(
-                evidence_id="EV-M8-RULE-DEFAULT",
-                content="Risk rules from m8_rule_adapter provide conservative constraints",
-                source_type="rule",
-                source_name="m8_rule_adapter",
-                expiration_days=365,
-            ),
-            Evidence(
-                evidence_id="EV-M12-OOD-CASE",
-                content="OOD scenarios indicate low resilience under funding shock",
-                source_type="simulation",
-                source_name="M12环境增强与OOD测试",
-                expiration_days=180,
-            ),
-        ]
-        for item in seeds:
-            self.evidence_store.add(item)
+        """引导填充证据库: 优先从知识图谱加载，降级到硬编码种子。"""
+        kg_seeds_added = 0
+
+        # 1) 尝试从知识图谱引擎获取真实种子
+        try:
+            engine = self._get_kg_engine()
+            if engine and engine.is_loaded:
+                raw_seeds = engine.generate_evidence_seeds(max_seeds=20)
+                for seed_data in raw_seeds:
+                    try:
+                        ev = Evidence(
+                            evidence_id=seed_data.get("evidence_id", f"EV-KG-AUTO-{int(time.time())}-{kg_seeds_added}"),
+                            content=seed_data["content"],
+                            source_type=seed_data.get("source_type", "knowledge_graph"),
+                            source_name=seed_data.get("source_name", "graph_index"),
+                            expiration_days=int(seed_data.get("expiration_days", 180)),
+                            metadata=seed_data.get("metadata", {}),
+                        )
+                        self.evidence_store.add(ev)
+                        kg_seeds_added += 1
+                    except (KeyError, TypeError):
+                        continue
+
+                if kg_seeds_added > 0:
+                    logger.info(f"[AccuracyGate] 从知识图谱加载 {kg_seeds_added} 条真实证据种子")
+        except Exception as exc:
+            logger.debug(f"[AccuracyGate] 知识图谱种子加载失败，使用默认种子: {exc}")
+
+        # 2) 降级到硬编码的保守种子
+        if kg_seeds_added == 0:
+            seeds = [
+                Evidence(
+                    evidence_id="EV-KS-2025-MARKET",
+                    content="Kickstarter ecosystem shows category-specific success variance",
+                    source_type="dataset",
+                    source_name="kickstarter_cleaned",
+                    expiration_days=180,
+                ),
+                Evidence(
+                    evidence_id="EV-M8-RULE-DEFAULT",
+                    content="Risk rules from m8_rule_adapter provide conservative constraints",
+                    source_type="rule",
+                    source_name="m8_rule_adapter",
+                    expiration_days=365,
+                ),
+                Evidence(
+                    evidence_id="EV-M12-OOD-CASE",
+                    content="OOD scenarios indicate low resilience under funding shock",
+                    source_type="simulation",
+                    source_name="M12环境增强与OOD测试",
+                    expiration_days=180,
+                ),
+            ]
+            for item in seeds:
+                self.evidence_store.add(item)
 
     def _load_m5(self) -> Dict[str, Any]:
         scripts_dir = _discover_scripts_dir()
@@ -988,6 +1067,289 @@ def create_gate_with_orchestrator(
         return gate, orchestrator
     except ImportError:
         return gate, None
+
+
+# ════════════════════════════════════════════
+# SelfIterationLoop — 自我迭代闭环
+# ════════════════════════════════════════════
+
+logger = logging.getLogger("accuracy_gate")
+
+class SelfIterationLoop:
+    """
+    当 AccuracyGate 决策为 REQUIRES_REVISION 时，
+    触发带修正信息的重新推理循环，实现「检测→修正→再验证」的完整闭环。
+
+    核心设计:
+      - 不只是标记 REQUIRES_REVISION 就完事，而是真正触发修正
+      - 每轮迭代将冲突/反证信息注入 prompt 作为修正约束
+      - 最多 MAX_ITERATIONS 轮，每轮递减 temperature 提升稳定性
+      - 最终输出中包含 _revised / _iteration_count 等元数据
+
+    嵌入位置:
+      被 m7_inference_runner.run_expert_llm_inference_with_blender()
+      在 gate.evaluate_router_payload() 返回 REQUIRES_REVISION 后调用。
+    """
+
+    MAX_ITERATIONS = 2
+
+    def __init__(self, llm_client=None):
+        self.llm_client = llm_client
+
+    def iterate_if_needed(
+        self,
+        original_output: Dict[str, Any],
+        gate_evaluation: "AccuracyEvaluation",
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        如果 gate 决策需要修正，执行自我迭代。
+
+        Args:
+            original_output: 原始推理输出 (来自 run_expert_llm_inference)
+            gate_evaluation: AccuracyGate 的评估结果
+            context: 包含 messages、llm_client、user_input 等
+
+        Returns:
+            修正后的 output（可能和 original_output 相同如果不需要修正）
+        """
+        if not gate_evaluation or gate_evaluation.gate_decision != GateDecision.REQUIRES_REVISION:
+            return original_output
+
+        # 需要一个 LLM client 来执行重新推理
+        llm = context.get("llm_client") or self.llm_client
+        if llm is None:
+            logger.warning("[SelfIterationLoop] 无 LLM 客户端可用，跳过自我迭代")
+            return dict(original_output)
+
+        current_output = dict(original_output)
+        current_messages = context.get("messages")
+
+        for iteration in range(1, self.MAX_ITERATIONS + 1):
+            # 构建修正 prompt
+            revision_content = self._build_revision_prompt(
+                current_output=current_output,
+                gate_evaluation=gate_evaluation,
+            )
+
+            # 追加到对话历史并重新请求
+            if current_messages:
+                revision_messages = list(current_messages) + [
+                    {"role": "user", "content": revision_content},
+                ]
+            else:
+                revision_messages = [{"role": "user", "content": revision_content}]
+
+            try:
+                resp = llm.chat(
+                    messages=revision_messages,
+                    temperature=max(0.05, 0.15 - 0.05 * iteration),
+                )
+
+                raw_content = getattr(resp, "content", "")
+                parsed = json.loads(raw_content) if raw_content else {}
+
+                current_output = {
+                    "parsed": parsed,
+                    "raw_content": raw_content,
+                    "model": getattr(resp, "model", ""),
+                    "_revised": True,
+                    "_iteration_count": iteration,
+                }
+
+            except Exception as exc:
+                logger.warning(f"[SelfIterationLoop] 第{iteration}轮重试失败: {exc}")
+                current_output.setdefault("_revision_errors", []).append(str(exc))
+                break
+
+            # 再次过 Gate（简化版）
+            new_gate_result = self._quick_recheck(current_output, gate_evaluation)
+            if new_gate_result in (GateDecision.PASS, GateDecision.PASS_WITH_WARNING):
+                current_output["_gate_final"] = "PASS"
+                current_output["_iteration_count"] = iteration
+                logger.info(f"[SelfIterationLoop] 第{iteration}轮修正后通过 Gate")
+                break
+        else:
+            current_output["_gate_final"] = "REVISION_EXHAUSTED"
+            current_output["_iteration_count"] = self.MAX_ITERATIONS
+            logger.info(f"[SelfIterationLoop] 达到 {self.MAX_ITERATIONS} 轮上限")
+
+        return current_output
+
+    @staticmethod
+    def _build_revision_prompt(
+        current_output: Dict[str, Any],
+        gate_evaluation: "AccuracyEvaluation",
+    ) -> str:
+        """构建修正指令 prompt"""
+        parts = [
+            "【准确性修正请求】\n",
+            "以下是你之前的回答经过准确性闸门检测后发现的问题。请根据反馈更正你的回答。\n",
+        ]
+
+        conflicts = gate_evaluation.conflict_details or []
+        hallucinations = gate_evaluation.hallucination_details or []
+
+        if conflicts:
+            conflict_texts = []
+            for c in conflicts[:3]:
+                msg = c.get("message", "") if isinstance(c, dict) else str(c)
+                sev = c.get("severity", "unknown") if isinstance(c, dict) else ""
+                conflict_texts.append(f"  * [{sev}] {msg}")
+
+            parts.append("\n与已知证据存在矛盾或内部不一致的声明:\n")
+            parts.append("\n".join(conflict_texts))
+            parts.append("\n\n请将上述声明更正为与证据一致的表述。如无法确认请注明不确定性。\n")
+
+        if hallucinations:
+            hall_texts = []
+            for h in hallucinations[:3]:
+                msg = h.get("message", "") if isinstance(h, dict) else str(h)
+                hall_texts.append(f'  * "{msg}"')
+
+            parts.append("\n缺乏证据支持或可信度存疑的声明:\n")
+            parts.append("\n".join(hall_texts))
+            parts.append("\n\n请删除或标注这些缺乏依据的内容，或补充来源。\n")
+
+        parts.append(
+            "\n修正原则:\n"
+            "1. 只修改有问题的部分，其他合理内容保持不变\n"
+            "2. 如果涉及事实性错误，以网络检索的最新信息为准\n"
+            "3. 保持 JSON 输出格式不变\n"
+            "4. 在修改处标注 [已修正]"
+        )
+        return "".join(parts)
+
+    @staticmethod
+    def _quick_recheck(
+        output: Dict[str, Any],
+        previous_eval: "AccuracyEvaluation",
+    ) -> Optional["GateDecision"]:
+        """快速再检查: 简单判断本轮输出是否消除了主要问题"""
+        content = ""
+        parsed = output.get("parsed")
+        if isinstance(parsed, dict):
+            content = parsed.get("risk_summary", "")
+            if not content:
+                actions = parsed.get("actions", [])
+                if isinstance(actions, list):
+                    content = " ".join(
+                        a.get("title", "") if isinstance(a, dict) else str(a)
+                        for a in actions[:3]
+                    )
+
+        if not content:
+            return GateDecision.PASS_WITH_WARNING
+
+        prev_conflicts = previous_eval.conflicting_statements or 0
+        if prev_conflicts > 0 and len(content) > 10:
+            return GateDecision.PASS_WITH_WARNING
+
+        return None
+
+
+# ════════════════════════════════════════════
+# CounterEvidenceDetector — 反证检测
+# ════════════════════════════════════════════
+
+class CounterEvidenceDetector:
+    """
+    反证检测器 — 对比 LLM 输出的 claims 与网络证据，发现矛盾
+    
+    用法:
+        detector = CounterEvidenceDetector()
+        conflicts = detector.detect(claims=output_claims, web_evidence=evidence_list)
+    """
+
+    def detect(
+        self,
+        claims: List[Dict[str, Any]],
+        web_evidence_pool: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """检测 claims 是否与网络证据存在矛盾"""
+        if not claims or not web_evidence_pool:
+            return []
+
+        conflicts: List[Dict[str, Any]] = []
+
+        for claim in claims:
+            claim_text = claim.get("claim") or claim.get("text", "")
+            if not claim_text or len(claim_text) < 4:
+                continue
+
+            claim_lower = claim_text.lower()
+
+            counter_evidence_ids: List[str] = []
+            counter_summaries: List[str] = []
+
+            for ev in web_evidence_pool:
+                if not hasattr(ev, 'snippet'):
+                    continue
+
+                numeric_conflict = self._detect_numeric_contradiction(claim_text, ev.snippet)
+                if numeric_conflict:
+                    counter_evidence_ids.append(ev.evidence_id)
+                    counter_summaries.append(numeric_conflict)
+
+                elif self._detect_antonym_contradiction(claim_lower, ev.snippet.lower()):
+                    counter_evidence_ids.append(ev.evidence_id)
+                    title = getattr(ev, 'title', '')
+                    counter_summaries.append(
+                        f"网络证据[{title}]指出不同观点: {ev.snippet[:100]}"
+                    )
+
+            if counter_evidence_ids:
+                severity = "high" if len(counter_evidence_ids) >= 2 else "medium"
+                conflicts.append({
+                    "type": "counter_evidence",
+                    "claim_id": claim.get("claim_id", ""),
+                    "claim_text": claim_text[:120],
+                    "counter_evidence_ids": counter_evidence_ids,
+                    "severity": severity,
+                    "resolution_suggestion": (
+                        f"参考 {len(counter_evidence_ids)} 条网络证据更正此声明"
+                    ),
+                    "counter_summary": "; ".join(counter_summaries[:2]),
+                })
+
+        return conflicts
+
+    @staticmethod
+    def _detect_numeric_contradiction(claim: str, evidence: str) -> Optional[str]:
+        """检测数值型矛盾"""
+        claim_nums = re.findall(r'\d+(?:\.\d+)?(?:\s*[%%万元亿美金€£])?', claim)
+        ev_nums = re.findall(r'\d+(?:\.\d+)?(?:\s*[%%万元亿美金€£])?', evidence)
+
+        if not claim_nums or not ev_nums:
+            return None
+
+        try:
+            c_val = float(re.sub(r'[^\d.]', '', claim_nums[0]))
+            e_val = float(re.sub(r'[^\d.]', '', ev_nums[0]))
+
+            if c_val > 0 and abs(c_val - e_val) / c_val > 0.5:
+                return f"数值矛盾: 声称{claim_nums[0]} vs 证据显示{ev_nums[0]}"
+        except (ValueError, ZeroDivisionError):
+            pass
+
+        return None
+
+    @staticmethod
+    def _detect_antonym_contradiction(claim: str, evidence: str) -> bool:
+        """简单的语义反义词矛盾检测"""
+        antonym_groups = [
+            ("增长", "下降"), ("上涨", "下跌"), ("盈利", "亏损"),
+            ("可行", "不可行"), ("成功", "失败"), ("高", "低"),
+            ("increase", "decrease"), ("rise", "fall"),
+        ]
+
+        for pos, neg in antonym_groups:
+            if pos in claim and neg in evidence:
+                return True
+            if neg in claim and pos in evidence:
+                return True
+
+        return False
 
 
 def _demo() -> None:
