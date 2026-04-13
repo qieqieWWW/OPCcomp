@@ -6,9 +6,32 @@ import { randomUUID } from "crypto";
 import * as path from "path";
 import { OpenClawRuntime } from "../runtime";
 
+const WebSocket = require("ws") as typeof import("ws");
+type RawData = import("ws").RawData;
+
 type ExecuteRequestBody = {
   input?: unknown;
   openId?: unknown;
+};
+
+type RuntimeRelayExecuteRequest = {
+  type: "execute_request";
+  requestId: string;
+  input: string;
+  openId: string;
+};
+
+type RuntimeRelayExecuteResponse = {
+  type: "execute_response";
+  requestId: string;
+  response: RuntimeExecuteResponse;
+};
+
+type RuntimeRelayRegisterMessage = {
+  type: "register";
+  role: "runtime-worker";
+  clientId: string;
+  version: string;
 };
 
 type CollaborationEdge = {
@@ -46,6 +69,21 @@ type OpcRouteResponse = {
   message?: string;
 };
 
+type RuntimeExecutionPayload = {
+  ok: true;
+  taskId: string;
+  result: string;
+  succeeded: unknown;
+  failed: unknown;
+  execution_trace: Record<string, unknown>;
+};
+
+type RuntimeExecuteResponse = RuntimeExecutionPayload | {
+  ok: false;
+  error: string;
+  message?: string;
+};
+
 class OpcUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -62,8 +100,13 @@ const OPC_ROUTER_URL = process.env.OPC_ROUTER_URL ?? "http://127.0.0.1:18081/rou
 const OPC_ROUTER_TIMEOUT_MS = Number(process.env.OPC_ROUTER_TIMEOUT_MS ?? "90000");
 // 默认关闭远程 LLM 摘要，避免 /route 额外 60s+ 开销导致端到端超时。
 const OPC_ROUTER_TRY_REMOTE_LLM = String(process.env.OPC_ROUTER_TRY_REMOTE_LLM ?? "false").toLowerCase() === "true";
+const RUNTIME_RELAY_URL = process.env.RUNTIME_RELAY_URL ?? "";
+const RUNTIME_RELAY_TOKEN = process.env.RUNTIME_RELAY_TOKEN ?? "";
+const RUNTIME_RELAY_CLIENT_ID = process.env.RUNTIME_RELAY_CLIENT_ID ?? `runtime-worker-${process.pid}`;
 
 const runtime = new OpenClawRuntime();
+let relaySocket: InstanceType<typeof WebSocket> | null = null;
+let relayReconnectTimer: NodeJS.Timeout | null = null;
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -88,81 +131,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const opcResult = await getRoutingFromOpcService(input);
-      const intent = normalizeIntent(opcResult.intent);
-
-      if (intent.type !== "task_request") {
-        return sendJson(res, 200, {
-          ok: true,
-          taskId: `chat-${Date.now()}`,
-          result: buildConversationReply(opcResult, input),
-          succeeded: [],
-          failed: [],
-          intent,
-        });
-      }
-
-      const taskId = `long-${Date.now()}-${randomUUID().slice(0, 8)}`;
-      // eslint-disable-next-line no-console
-      console.log(`[runtime-execute] [${taskId}] 收到执行请求，openId=${openId || "unknown"}, input="${input.slice(0, 80)}..."`);
-
-      const selectedExperts = normalizeSelectedExperts(opcResult.selected_experts);
-      const expertsForExecution = selectedExperts.length > 0
-        ? selectedExperts
-        : buildDefaultExperts();
-      // eslint-disable-next-line no-console
-      console.log(`[runtime-execute] [${taskId}] OPC 路由完成，experts=${expertsForExecution.map((e) => String(e.name ?? "")).join(",")}, tier=${opcResult.small_model?.tier ?? "?"}`);
-      // eslint-disable-next-line no-console
-      console.log(`[runtime-execute] [${taskId}] 开始调用 runtime.execute()...`);
-
-      if (selectedExperts.length === 0) {
-        // eslint-disable-next-line no-console
-        console.warn(`[runtime-execute] [${taskId}] router returned empty selected_experts, fallback to default experts`);
-      }
-
-      const collaborationEdges = normalizeEdges(opcResult.collaboration_plan?.edges);
-      // eslint-disable-next-line no-console
-      console.log(`[runtime-execute] [${taskId}] 协作依赖边（过滤后）: ${collaborationEdges.map((e) => `${e.from}->${e.to}`).join(", ") || "(无)"}`);
-      const tier = normalizeTier(opcResult.small_model?.tier);
-
-      // 合并 info_pool_hits 与 knowledge_graph_hits，统一作为证据命中传递
-      const allHits = [
-        ...(opcResult.info_pool_hits ?? []),
-        ...(opcResult.knowledge_graph_hits ?? []),
-      ];
-      if (allHits.length > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`[runtime-execute] [${taskId}] 聚合命中数据：${opcResult.info_pool_hits?.length ?? 0} info_pool + ${opcResult.knowledge_graph_hits?.length ?? 0} knowledge_graph = ${allHits.length} total`);
-      }
-
-      const result = await runtime.execute({
-        taskId,
-        bossInstruction: input,
-        small_model: { tier },
-        selected_experts: expertsForExecution,
-        collaboration_plan: { edges: collaborationEdges },
-        info_pool_hits: allHits,
-        output_attribution: {
-          ...(opcResult.output_attribution ?? {}),
-          source: "competition-router+runtime-execute-server",
-        },
-        runtime_trace: {
-          ...(opcResult.runtime_trace ?? {}),
-          source: "competition-router+runtime-execute-server",
-          openId: openId || "unknown",
-        },
-      });
-
-      logRuntimeExecutionTrace(taskId, result);
-
-      return sendJson(res, 200, {
-        ok: true,
-        taskId: result.taskId,
-        result: buildReplyText(result),
-        succeeded: result.succeeded,
-        failed: result.failed,
-        execution_trace: summarizeExecutionTrace(result),
-      });
+      const payload = await executeRuntimePipeline(input, openId);
+      return sendJson(res, 200, payload);
     } catch (error) {
       if (error instanceof OpcUnavailableError) {
         return sendJson(res, 503, {
@@ -191,7 +161,171 @@ server.listen(RUNTIME_PORT, RUNTIME_HOST, () => {
   console.log(`[runtime-execute] listening on http://${RUNTIME_HOST}:${RUNTIME_PORT}`);
   // eslint-disable-next-line no-console
   console.log("[runtime-execute] execute path: POST /execute");
+  startRuntimeRelayClient();
 });
+
+async function executeRuntimePipeline(input: string, openId: string): Promise<RuntimeExecuteResponse> {
+  const opcResult = await getRoutingFromOpcService(input);
+  const intent = normalizeIntent(opcResult.intent);
+
+  if (intent.type !== "task_request") {
+    return {
+      ok: true,
+      taskId: `chat-${Date.now()}`,
+      result: buildConversationReply(opcResult, input),
+      succeeded: [],
+      failed: [],
+      execution_trace: {
+        intent,
+        source: "competition-router+runtime-execute-server",
+      },
+    };
+  }
+
+  const taskId = `long-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  // eslint-disable-next-line no-console
+  console.log(`[runtime-execute] [${taskId}] 收到执行请求，openId=${openId || "unknown"}, input="${input.slice(0, 80)}..."`);
+
+  const selectedExperts = normalizeSelectedExperts(opcResult.selected_experts);
+  const expertsForExecution = selectedExperts.length > 0
+    ? selectedExperts
+    : buildDefaultExperts();
+  // eslint-disable-next-line no-console
+  console.log(`[runtime-execute] [${taskId}] OPC 路由完成，experts=${expertsForExecution.map((e) => String(e.name ?? "")).join(",")}, tier=${opcResult.small_model?.tier ?? "?"}`);
+  // eslint-disable-next-line no-console
+  console.log(`[runtime-execute] [${taskId}] 开始调用 runtime.execute()...`);
+
+  if (selectedExperts.length === 0) {
+    // eslint-disable-next-line no-console
+    console.warn(`[runtime-execute] [${taskId}] router returned empty selected_experts, fallback to default experts`);
+  }
+
+  const collaborationEdges = normalizeEdges(opcResult.collaboration_plan?.edges);
+  // eslint-disable-next-line no-console
+  console.log(`[runtime-execute] [${taskId}] 协作依赖边（过滤后）: ${collaborationEdges.map((e) => `${e.from}->${e.to}`).join(", ") || "(无)"}`);
+  const tier = normalizeTier(opcResult.small_model?.tier);
+
+  // 合并 info_pool_hits 与 knowledge_graph_hits，统一作为证据命中传递
+  const allHits = [
+    ...(opcResult.info_pool_hits ?? []),
+    ...(opcResult.knowledge_graph_hits ?? []),
+  ];
+  if (allHits.length > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[runtime-execute] [${taskId}] 聚合命中数据：${opcResult.info_pool_hits?.length ?? 0} info_pool + ${opcResult.knowledge_graph_hits?.length ?? 0} knowledge_graph = ${allHits.length} total`);
+  }
+
+  const result = await runtime.execute({
+    taskId,
+    bossInstruction: input,
+    small_model: { tier },
+    selected_experts: expertsForExecution,
+    collaboration_plan: { edges: collaborationEdges },
+    info_pool_hits: allHits,
+    output_attribution: {
+      ...(opcResult.output_attribution ?? {}),
+      source: "competition-router+runtime-execute-server",
+    },
+    runtime_trace: {
+      ...(opcResult.runtime_trace ?? {}),
+      source: "competition-router+runtime-execute-server",
+      openId: openId || "unknown",
+    },
+  });
+
+  logRuntimeExecutionTrace(taskId, result);
+
+  return {
+    ok: true,
+    taskId: result.taskId,
+    result: buildReplyText(result),
+    succeeded: result.succeeded,
+    failed: result.failed,
+    execution_trace: summarizeExecutionTrace(result),
+  };
+}
+
+function startRuntimeRelayClient(): void {
+  if (!RUNTIME_RELAY_URL) {
+    // eslint-disable-next-line no-console
+    console.log("[runtime-execute] RUNTIME_RELAY_URL 未配置，保持 HTTP 模式。");
+    return;
+  }
+
+  const connect = (): void => {
+    const relayUrl = buildRelayUrl(RUNTIME_RELAY_URL, RUNTIME_RELAY_TOKEN);
+    // eslint-disable-next-line no-console
+    console.log(`[runtime-execute] connecting relay: ${relayUrl.replace(/token=[^&]+/i, "token=***")}`);
+    const socket = new WebSocket(relayUrl);
+    relaySocket = socket;
+
+    socket.on("open", () => {
+      const registerMessage: RuntimeRelayRegisterMessage = {
+        type: "register",
+        role: "runtime-worker",
+        clientId: RUNTIME_RELAY_CLIENT_ID,
+        version: "1",
+      };
+      socket.send(JSON.stringify(registerMessage));
+      // eslint-disable-next-line no-console
+      console.log(`[runtime-execute] relay connected as ${RUNTIME_RELAY_CLIENT_ID}`);
+    });
+
+    socket.on("message", async (data: RawData) => {
+      try {
+        const text = typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8") : Buffer.from(data as ArrayBuffer).toString("utf8");
+        const message = JSON.parse(text) as Partial<RuntimeRelayExecuteRequest> & { type?: string; requestId?: string; input?: string; openId?: string };
+        if (message.type !== "execute_request" || typeof message.requestId !== "string") {
+          return;
+        }
+        const input = typeof message.input === "string" ? message.input : "";
+        const openId = typeof message.openId === "string" ? message.openId : "";
+        const response = await executeRuntimePipeline(input, openId);
+        const relayResponse: RuntimeRelayExecuteResponse = {
+          type: "execute_response",
+          requestId: message.requestId,
+          response,
+        };
+        socket.send(JSON.stringify(relayResponse));
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error("[runtime-execute] relay message handling failed", error);
+      }
+    });
+
+    socket.on("close", () => {
+      relaySocket = null;
+      // eslint-disable-next-line no-console
+      console.warn("[runtime-execute] relay disconnected, scheduling reconnect...");
+      if (relayReconnectTimer) {
+        clearTimeout(relayReconnectTimer);
+      }
+      relayReconnectTimer = setTimeout(connect, 3000);
+    });
+
+    socket.on("error", (error: Error) => {
+      // eslint-disable-next-line no-console
+      console.error("[runtime-execute] relay websocket error", error);
+      try {
+        socket.close();
+      } catch {
+        // ignore
+      }
+    });
+  };
+
+  connect();
+}
+
+function buildRelayUrl(baseUrl: string, token: string): string {
+  if (!token) {
+    return baseUrl;
+  }
+
+  const url = new URL(baseUrl);
+  url.searchParams.set("token", token);
+  return url.toString();
+}
 
 function buildReplyText(result: {
   taskId: string;

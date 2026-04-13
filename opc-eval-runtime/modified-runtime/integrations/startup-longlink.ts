@@ -1,6 +1,8 @@
 /// <reference types="node" />
 
+import * as crypto from "crypto";
 import * as Lark from "@larksuiteoapi/node-sdk";
+import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -24,6 +26,26 @@ type RuntimeExecuteResponse = {
   error?: string;
   message?: string;
   result?: string;
+};
+
+type RuntimeRelayRequest = {
+  type: "execute_request";
+  requestId: string;
+  input: string;
+  openId: string;
+};
+
+type RuntimeRelayResponse = {
+  type: "execute_response";
+  requestId: string;
+  response: RuntimeExecuteResponse;
+};
+
+type RuntimeRelayRegister = {
+  type: "register";
+  role: "runtime-worker";
+  clientId: string;
+  version: string;
 };
 
 class RuntimeCallError extends Error {
@@ -230,10 +252,16 @@ const APP_ID = process.env.FEISHU_APP_ID ?? "";
 const APP_SECRET = process.env.FEISHU_APP_SECRET ?? "";
 const RUNTIME_EXECUTE_URL = process.env.FEISHU_RUNTIME_EXECUTE_URL ?? "http://127.0.0.1:30000/execute";
 const RUNTIME_TIMEOUT_MS = Number(process.env.FEISHU_RUNTIME_TIMEOUT_MS ?? "300000");
+const RUNTIME_RELAY_HOST = process.env.RUNTIME_RELAY_HOST ?? "0.0.0.0";
+const RUNTIME_RELAY_PORT = Number(process.env.RUNTIME_RELAY_PORT ?? "9091");
+const RUNTIME_RELAY_PATH = process.env.RUNTIME_RELAY_PATH ?? "/runtime-worker";
+const RUNTIME_RELAY_TOKEN = process.env.RUNTIME_RELAY_TOKEN ?? "";
 
 if (!APP_ID || !APP_SECRET) {
   throw new Error("FEISHU_APP_ID / FEISHU_APP_SECRET 未配置，无法启动飞书长连接");
 }
+
+const runtimeRelay = createRuntimeRelayServer();
 
 const baseConfig = {
   appId: APP_ID,
@@ -308,6 +336,7 @@ bot.start()
   .then(() => {
     // eslint-disable-next-line no-console
     console.log("[feishu-longlink] 飞书长连接已启动");
+    runtimeRelay.start();
   })
   .catch((error: unknown) => {
     // eslint-disable-next-line no-console
@@ -331,6 +360,11 @@ async function callRuntime(input: string, openId: string): Promise<RuntimeExecut
   const timeoutMs = Number.isFinite(RUNTIME_TIMEOUT_MS) && RUNTIME_TIMEOUT_MS > 0
     ? RUNTIME_TIMEOUT_MS
     : 30000;
+
+  const relayResponse = await runtimeRelay.requestExecution(input, openId, timeoutMs);
+  if (relayResponse) {
+    return relayResponse;
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -417,6 +451,290 @@ function mapRuntimeCode(code: string | undefined): string {
     return normalized;
   }
   return `ERR_${normalized}`;
+}
+
+function createRuntimeRelayServer() {
+  const pendingRequests = new Map<string, {
+    resolve: (response: RuntimeExecuteResponse) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+  }>();
+  let activeSocket: import("net").Socket | null = null;
+  let activeBuffer: Buffer<ArrayBufferLike> = Buffer.alloc(0) as Buffer<ArrayBufferLike>;
+  let startPromise: Promise<void> | null = null;
+
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      sendJson(res, 200, {
+        ok: true,
+        service: "feishu-runtime-relay",
+        host: RUNTIME_RELAY_HOST,
+        port: RUNTIME_RELAY_PORT,
+        workerConnected: Boolean(activeSocket),
+      });
+      return;
+    }
+
+    sendJson(res, 404, {
+      ok: false,
+      error: "not_found",
+      available: ["GET /health", `WS ${RUNTIME_RELAY_PATH}`],
+    });
+  });
+
+  server.on("upgrade", (req, socket) => {
+    try {
+      const url = new URL(req.url ?? "", "http://localhost");
+      if (url.pathname !== RUNTIME_RELAY_PATH) {
+        socket.destroy();
+        return;
+      }
+      if (RUNTIME_RELAY_TOKEN) {
+        const token = url.searchParams.get("token") ?? "";
+        if (token !== RUNTIME_RELAY_TOKEN) {
+          socket.destroy();
+          return;
+        }
+      }
+
+      const key = String(req.headers["sec-websocket-key"] ?? "");
+      if (!key) {
+        socket.destroy();
+        return;
+      }
+
+      const accept = crypto
+        .createHash("sha1")
+        .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest("base64");
+
+      const headers = [
+        "HTTP/1.1 101 Switching Protocols",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        `Sec-WebSocket-Accept: ${accept}`,
+        "\r\n",
+      ];
+      socket.write(headers.join("\r\n"));
+
+      if (activeSocket) {
+        try {
+          activeSocket.destroy();
+        } catch {
+          // ignore
+        }
+      }
+
+      activeSocket = socket as unknown as import("net").Socket;
+      activeBuffer = Buffer.alloc(0) as Buffer<ArrayBufferLike>;
+      socket.on("data", (chunk: Buffer) => {
+        activeBuffer = Buffer.concat([activeBuffer, chunk]);
+        drainRelayFrames();
+      });
+      socket.on("close", cleanupRelaySocket);
+      socket.on("error", cleanupRelaySocket);
+
+      sendRelayJson({
+        type: "relay_ready",
+        relay: "feishu-longlink",
+        message: "runtime relay connected",
+      });
+      // eslint-disable-next-line no-console
+      console.log("[feishu-longlink] runtime worker 已通过 WebSocket 接入");
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("[feishu-longlink] runtime relay upgrade failed", error);
+      socket.destroy();
+    }
+  });
+
+  function start(): void {
+    server.listen(RUNTIME_RELAY_PORT, RUNTIME_RELAY_HOST, () => {
+      // eslint-disable-next-line no-console
+      console.log(`[feishu-longlink] runtime relay listening on ws://${RUNTIME_RELAY_HOST}:${RUNTIME_RELAY_PORT}${RUNTIME_RELAY_PATH}`);
+    });
+  }
+
+  function cleanupRelaySocket(): void {
+    activeSocket = null;
+    activeBuffer = Buffer.alloc(0) as Buffer<ArrayBufferLike>;
+    for (const pending of pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("runtime relay disconnected"));
+    }
+    pendingRequests.clear();
+  }
+
+  function sendRelayJson(payload: Record<string, unknown>): void {
+    if (!activeSocket) {
+      return;
+    }
+    const text = JSON.stringify(payload);
+    activeSocket.write(encodeWsFrame(text));
+  }
+
+  function requestExecution(input: string, openId: string, timeoutMs: number): Promise<RuntimeExecuteResponse | null> {
+    if (!activeSocket) {
+      return Promise.resolve(null);
+    }
+
+    const requestId = `relay-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const payload: RuntimeRelayRequest = {
+      type: "execute_request",
+      requestId,
+      input,
+      openId,
+    };
+
+    return new Promise<RuntimeExecuteResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingRequests.delete(requestId);
+        reject(new Error(`runtime relay timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      pendingRequests.set(requestId, { resolve, reject, timer });
+      sendRelayJson(payload);
+    }).catch(() => null);
+  }
+
+  function onRelayMessage(text: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return;
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      return;
+    }
+
+    const message = parsed as Partial<RuntimeRelayResponse> & { type?: string; requestId?: string; response?: RuntimeExecuteResponse };
+    if (message.type !== "execute_response" || typeof message.requestId !== "string") {
+      return;
+    }
+
+    const pending = pendingRequests.get(message.requestId);
+    if (!pending) {
+      return;
+    }
+
+    pendingRequests.delete(message.requestId);
+    clearTimeout(pending.timer);
+    pending.resolve(message.response ?? {});
+  }
+
+  function drainRelayFrames(): void {
+    while (true) {
+      const parsed = readWsFrame(activeBuffer);
+      if (!parsed) {
+        return;
+      }
+
+      activeBuffer = parsed.rest;
+      if (parsed.opcode === 0x8) {
+        cleanupRelaySocket();
+        return;
+      }
+      if (parsed.opcode === 0x9) {
+        if (activeSocket) {
+          activeSocket.write(encodeWsFrame(parsed.payload, 0xA));
+        }
+        continue;
+      }
+      if (parsed.opcode !== 0x1) {
+        continue;
+      }
+      onRelayMessage(parsed.payload);
+    }
+  }
+
+  return {
+    start,
+    requestExecution,
+  };
+}
+
+function encodeWsFrame(text: string, opcode = 0x1): Buffer {
+  const payload = Buffer.from(text, "utf8");
+  const header: number[] = [0x80 | (opcode & 0x0f)];
+
+  if (payload.length < 126) {
+    header.push(payload.length);
+  } else if (payload.length < 65_536) {
+    header.push(126, (payload.length >> 8) & 0xff, payload.length & 0xff);
+  } else {
+    const lengthBuffer = Buffer.alloc(8);
+    lengthBuffer.writeBigUInt64BE(BigInt(payload.length));
+    header.push(127, ...Array.from(lengthBuffer.values()));
+  }
+
+  return Buffer.concat([Buffer.from(header), payload]);
+}
+
+function readWsFrame(buffer: Buffer): { opcode: number; payload: string; rest: Buffer } | null {
+  if (buffer.length < 2) {
+    return null;
+  }
+
+  const firstByte = buffer[0] ?? 0;
+  const secondByte = buffer[1] ?? 0;
+  const opcode = firstByte & 0x0f;
+  const masked = (secondByte & 0x80) !== 0;
+  let offset = 2;
+  let length = secondByte & 0x7f;
+
+  if (length === 126) {
+    if (buffer.length < offset + 2) {
+      return null;
+    }
+    length = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (length === 127) {
+    if (buffer.length < offset + 8) {
+      return null;
+    }
+    const bigLength = buffer.readBigUInt64BE(offset);
+    if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("websocket frame too large");
+    }
+    length = Number(bigLength);
+    offset += 8;
+  }
+
+  let mask: Buffer | null = null;
+  if (masked) {
+    if (buffer.length < offset + 4) {
+      return null;
+    }
+    mask = buffer.subarray(offset, offset + 4);
+    offset += 4;
+  }
+
+  if (buffer.length < offset + length) {
+    return null;
+  }
+
+  let payload: Buffer<ArrayBufferLike> = Buffer.from(buffer.subarray(offset, offset + length)) as Buffer<ArrayBufferLike>;
+  if (mask) {
+    const unmasked: Buffer<ArrayBufferLike> = Buffer.alloc(payload.length) as Buffer<ArrayBufferLike>;
+    for (let i = 0; i < payload.length; i += 1) {
+      unmasked[i] = (payload[i] ?? 0) ^ (mask[i % 4] ?? 0);
+    }
+    payload = unmasked;
+  }
+
+  return {
+    opcode,
+    payload: payload.toString("utf8"),
+    rest: buffer.subarray(offset + length),
+  };
+}
+
+function sendJson(res: http.ServerResponse, statusCode: number, payload: Record<string, unknown>): void {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(payload));
 }
 
 function normalizeCreateTimeMs(value: unknown): number {

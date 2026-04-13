@@ -5,7 +5,7 @@ from pathlib import Path
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .blender import fuse_rule_based, pairrank
 from .info_pool import load_records, retrieve_from_info_pool
@@ -82,6 +82,8 @@ class DynamicRoutingPipeline:
             api_key=self.api_key,
             model=self.service_model,
         )
+        # 初始化证据编排器（可选）
+        self.evidence_orchestrator = self._init_evidence_orchestrator()
 
     def _build_local_candidate(self, expert: Dict[str, Any], user_text: str, info_hits: List[Dict[str, Any]]) -> Dict[str, Any]:
         top_guidelines = [str(x.get("record", {}).get("guideline", "")) for x in info_hits[:2]]
@@ -102,6 +104,33 @@ class DynamicRoutingPipeline:
             "dependencies": deps,
         }
         return {"expert": expert, "parsed": parsed}
+
+    def _init_evidence_orchestrator(self):
+        """初始化证据编排器 - 支持联网检索和证据融合"""
+        try:
+            repo_root = (self.project_root / ".." / "..").resolve()
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            
+            from OPCcomp.evidence_orchestrator import EvidenceOrchestrator
+            from OPCcomp.web_retriever import WebRetriever
+            
+            web_retriever = None
+            if os.getenv("ENABLE_WEB_SEARCH", "false").lower() == "true":
+                web_retriever = WebRetriever(
+                    api_key=os.getenv("SERPER_API_KEY"),
+                    engine=os.getenv("WEB_ENGINE", "mock"),
+                    cache_dir=os.getenv("WEB_CACHE_DIR", "./web_cache"),
+                )
+            
+            return EvidenceOrchestrator(
+                kb_retriever=None,
+                info_pool_retriever=lambda q, top_k=3: retrieve_from_info_pool(q, self.info_pool, top_k),
+                web_retriever=web_retriever,
+                enable_deduplication=True,
+            )
+        except Exception:
+            return None
 
     def _build_collaboration_plan(self, selected_experts: List[Dict[str, Any]]) -> Dict[str, Any]:
         names = [str(e.get("name", "")) for e in selected_experts]
@@ -449,6 +478,34 @@ class DynamicRoutingPipeline:
         candidates = [self._build_local_candidate(e, user_text, info_hits) for e in selected_experts]
         ranked = pairrank(candidates)
         fused = fuse_rule_based(ranked)
+        
+        # 调用证据编排器 - 补充证据（仅在有配置时）
+        orchestration_result = None
+        if self.evidence_orchestrator:
+            try:
+                from OPCcomp.evidence_orchestrator import EvidenceRequest
+                request = EvidenceRequest(
+                    query=user_text,
+                    output_claims=[],
+                    query_category=tier.lower() if tier else "general",
+                    required_evidence_count=3,
+                    min_evidence_coverage=0.7,
+                    allow_web_search=os.getenv("ENABLE_WEB_SEARCH", "false").lower() == "true",
+                    context={"tier": tier, "intent_type": intent.get("type", "")}
+                )
+                orchestration_result = self.evidence_orchestrator.orchestrate(request)
+                
+                # 融合到候选项
+                if orchestration_result and orchestration_result.search_triggered:
+                    fused["evidence_orchestration_metadata"] = {
+                        "search_triggered": True,
+                        "internal_count": len(orchestration_result.internal_evidence),
+                        "external_count": len(orchestration_result.external_evidence),
+                        "coverage": orchestration_result.coverage_score,
+                        "quality": orchestration_result.orchestration_quality,
+                    }
+            except Exception:
+                orchestration_result = None
 
         remote = None
         remote_called = bool(try_remote_llm)
@@ -474,6 +531,7 @@ class DynamicRoutingPipeline:
             "research_fusion": research_fusion,
             "ranked_candidates": ranked,
             "fused_result": fused,
+            "evidence_orchestration_result": orchestration_result,
             "remote_llm": remote,
             "output_attribution": self._build_output_attribution(remote_called=remote_called, remote_available=remote is not None),
             "runtime_trace": {
