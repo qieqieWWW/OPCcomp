@@ -350,13 +350,10 @@ function renderEvidenceBoundOutput(evidenceBoundOutput: {
             if (!text) {
               return null;
             }
-            const owner = normalizeText(item.owner, 40);
-            const dueHint = normalizeText(item.due_hint, 30);
-            const suffix = [owner ? `负责人：${owner}` : "", dueHint ? `时限：${dueHint}` : ""].filter(Boolean).join("，");
-            return suffix ? `${text}（${suffix}）` : text;
+            return text;
           })
           .filter((item): item is string => Boolean(item))
-          .map(expandActionLine),
+          .map(cleanReportText),
       )
     : [];
 
@@ -446,12 +443,6 @@ function renderTaskReport(result: {
     : "";
 
   // ── 各章节原始数据准备 ──
-  const quickConclusionRaw = hasConflict
-    ? null
-    : normalizeText(summary.overview ?? result.summary ?? result.fusedResult?.fusedContent, 520);
-  const quickConclusion = quickConclusionRaw ? cleanReportText(quickConclusionRaw) : null;
-  const businessValue = cleanReportText(normalizeText(summary.businessValue, 420) ?? "");
-  const nextStep = cleanReportText(normalizeText(summary.nextStep, 420) ?? "");
   const riskView = cleanReportText(normalizeText(summary.riskView, 420) ?? "");
 
   const highlights = Array.isArray(summary.highlights)
@@ -459,6 +450,8 @@ function renderTaskReport(result: {
         summary.highlights
           .map((item) => normalizeText(item, 420))
           .filter((item): item is string => Boolean(item))
+          // 过滤掉评分、评级、建议推进等条目
+          .filter((item) => !/评分\s*\d+\s*\/\s*100|评级\s*[A-D]|建议\s*(推进|谨慎|暂停)|质量评分|可行性评分/i.test(item))
           .map(cleanReportText),
       )
     : [];
@@ -469,15 +462,16 @@ function renderTaskReport(result: {
           .map((item) => {
             const text = normalizeText(item.text, 420);
             if (!text) return null;
+            // 过滤掉评分、评级相关条目
+            if (/评分\s*\d+\s*\/\s*100|评级\s*[A-D]|质量评分|可行性评分/i.test(text)) return null;
             const decisionType = String(item.decision_type ?? "estimate");
-            // 真实证据前缀标注：让用户一眼区分事实声明与聚合判断
             const prefix = decisionType === "factual"
               ? "🔍 "
               : decisionType === "reference"
                 ? "📎 "
                 : decisionType === "contextual"
                   ? "📋 "
-                  : ""; // estimate 类型不加前缀，保持原有格式
+                  : "";
             return `${prefix}${text}`;
           })
           .filter((item): item is string => Boolean(item))
@@ -501,6 +495,8 @@ function renderTaskReport(result: {
       )
     : [];
 
+  const businessValue = cleanReportText(normalizeText(summary.businessValue, 420) ?? "");
+
   const actions = Array.isArray(evidenceBoundOutput.actions)
     ? dedupeSemanticLines(
         evidenceBoundOutput.actions
@@ -509,30 +505,7 @@ function renderTaskReport(result: {
             if (!text) {
               return null;
             }
-            const owner = normalizeText(item.owner, 40);
-            const dueHint = normalizeText(item.due_hint, 30);
-            const suffix = [owner ? `负责人：${owner}` : "", dueHint ? `时限：${dueHint}` : ""].filter(Boolean).join("，");
-            return suffix ? `${text}（${suffix}）` : text;
-          })
-          .filter((item): item is string => Boolean(item))
-          .map(expandActionLine)
-          .map(cleanReportText),
-      )
-    : [];
-
-  // 分部门摘要：截断过长文本（修复 LLM 原始输出泄露）
-  const departmentSummaries = Array.isArray(result.departmentOutputs)
-    ? dedupeSemanticLines(
-        result.departmentOutputs
-          .map((item) => {
-            const name = formatDepartmentName(item.department);
-            const rawText = normalizeText(item.summary, 360);
-            if (!name || !rawText) {
-              return null;
-            }
-            // 截断到 200 字符，避免 LLM 原始长段落泄露
-            const text = rawText.length > 200 ? `${rawText.slice(0, 197)}…` : rawText;
-            return `${name}：${text}`;
+            return text;
           })
           .filter((item): item is string => Boolean(item))
           .map(cleanReportText),
@@ -553,46 +526,30 @@ function renderTaskReport(result: {
     sections.push(`一、证据锚点\n${evidenceAnchors.join("\n")}`);
   }
 
-  // 【二、快速结论】仅一句话判断 + 可行性/风险摘要
-  // 不重复 claims 内容，不展开细节
-  if (quickConclusion) {
-    sections.push(`二、快速结论\n${quickConclusion}`);
-  } else if (hasConflict) {
-    sections.push("二、快速结论\n- 当前证据存在冲突，暂不输出单一确定性判断。请先按下方处理建议补充验证。");
-  }
-
-  // 【三、关键发现】仅 highlights 中非评分类的独特发现
-  // 核心修复：去除 claims 重复 + 去除与快速结论雷同的评分条目
-  const scorePattern = /评分\s*\d+\s*\/\s*100|建议\s*(推进|谨慎|暂停)/;
-  const uniqueHighlights = highlights
-    .filter((h) => !scorePattern.test(h))  // 去掉"可行性评分 XX/100"等已在快速结论出现的内容
-    .slice(0, 5);
-  const coreFindings = dedupeSemanticLines(uniqueHighlights);
+  // 【二、关键发现】highlights 中非评分类的独特发现
+  const coreFindings = dedupeSemanticLines(highlights.slice(0, 5));
   if (coreFindings.length > 0) {
-    sections.push(`三、关键发现\n${coreFindings.map((item) => `- ${item}`).join("\n")}`);
+    sections.push(`二、关键发现\n${coreFindings.map((item) => `- ${item}`).join("\n")}`);
   }
 
-  // 【四、分部门分析】各部门精炼摘要（已在上层截断到 200 字符）
-  if (departmentSummaries.length > 0) {
-    sections.push(`四、分部门分析\n${departmentSummaries.map((item) => `- ${item}`).join("\n")}`);
-  }
-
-  // 【五、风险与不确定性】风险视图 + 冲突项
+  // 【三、风险与不确定性】风险视图 + 冲突项
   const riskLines = dedupeSemanticLines([
     ...(riskView ? [riskView] : []),
     ...conflicts.slice(0, 4),
   ]);
   if (riskLines.length > 0) {
-    sections.push(`五、风险与不确定性\n${riskLines.map((item) => `- ${item}`).join("\n")}`);
+    sections.push(`三、风险与不确定性\n${riskLines.map((item) => `- ${item}`).join("\n")}`);
   }
 
-  // 【六、建议与下一步】动作项 + 执行细化（不再过度展开）
-  const nextActions = dedupeSemanticLines([
-    ...(nextStep ? [nextStep] : []),  // 不再对 nextStep 调用 expandActionLine 避免过度展开
-    ...actions.slice(0, 4),
-  ]);
-  if (nextActions.length > 0) {
-    sections.push(`六、建议与下一步\n${nextActions.map((item) => `- ${item}`).join("\n")}`);
+  // 【四、建议与下一步】businessValue 大方向 + 动作项（不含负责人/时限）
+  const sectionLines: string[] = [];
+  if (businessValue) {
+    sectionLines.push(`📌 ${businessValue}`);
+  }
+  const nextActions = dedupeSemanticLines(actions.slice(0, 4));
+  sectionLines.push(...nextActions.map((item) => `- ${item}`));
+  if (sectionLines.length > 0) {
+    sections.push(`四、建议与下一步\n${sectionLines.join("\n")}`);
   }
 
   if (sections.length === 0) {
@@ -730,21 +687,6 @@ function buildConsistencyNote(allText: string): string {
   return dedupeSemanticLines(notes).join(" ");
 }
 
-function expandActionLine(line: string): string {
-  const text = cleanReportText(line);
-
-  // 仅做轻量级执行提示，不再生成大段展开文本
-  if (/市场调研|竞品|需求验证/i.test(text)) {
-    return `${text}（建议48h内完成竞品分析）`;
-  }
-
-  if (/Arduino|许可证|开源许可|知识产权/i.test(text)) {
-    return `${text}（建议建立SBOM依赖清单）`;
-  }
-
-  return text;
-}
-
 function formatDepartmentName(rawDepartment?: string): string | null {
   const department = normalizeText(rawDepartment, 40)?.toLowerCase();
   if (!department) {
@@ -831,9 +773,9 @@ function looksStructuredPayload(text: string): boolean {
   return false;
 }
 
-function normalizeDegradeReason(reason: unknown): "NO_EVIDENCE" | "STALE_EVIDENCE" | "EVIDENCE_CONFLICT" | "" {
+function normalizeDegradeReason(reason: unknown): "NO_EVIDENCE" | "STALE_EVIDENCE" | "EVIDENCE_CONFLICT" | "AGENT_OFFLINE" | "" {
   const value = String(reason ?? "").trim().toUpperCase();
-  if (value === "NO_EVIDENCE" || value === "STALE_EVIDENCE" || value === "EVIDENCE_CONFLICT") {
+  if (value === "NO_EVIDENCE" || value === "STALE_EVIDENCE" || value === "EVIDENCE_CONFLICT" || value === "AGENT_OFFLINE") {
     return value;
   }
   return "";
@@ -875,12 +817,23 @@ function renderConflictGateReply(evidenceBoundOutput: {
 function renderDegradedEvidenceReply(evidenceBoundOutput: {
   actions?: Array<{ text?: string; owner?: string; due_hint?: string }>;
   output_meta?: { coverage?: number };
-} | undefined, degradeReason: "NO_EVIDENCE" | "STALE_EVIDENCE" | "EVIDENCE_CONFLICT"): string {
+} | undefined, degradeReason: "NO_EVIDENCE" | "STALE_EVIDENCE" | "EVIDENCE_CONFLICT" | "AGENT_OFFLINE"): string {
   if (degradeReason === "EVIDENCE_CONFLICT") {
     return renderConflictGateReply(evidenceBoundOutput as {
       conflicts?: Array<{ reason?: string; resolution?: string }>;
       actions?: Array<{ text?: string; owner?: string; due_hint?: string }>;
     });
+  }
+
+  // AGENT_OFFLINE：大脑掉线，不是证据问题
+  if (degradeReason === "AGENT_OFFLINE") {
+    const lines: string[] = [
+      "当前 AI 评估 Agent 暂时不可用（连接异常），无法完成评估。",
+      "这不代表评估内容本身有问题，而是评估引擎暂时无法响应。",
+      "建议稍后重试，或联系管理员检查 Agent 服务状态。",
+      "FAULT_CODE:AGENT_OFFLINE",
+    ];
+    return lines.join("\n");
   }
 
   const actions = Array.isArray(evidenceBoundOutput?.actions)

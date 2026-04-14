@@ -115,7 +115,7 @@ export class EvidenceAgent extends DepartmentAgentRuntime {
     ].join("\n");
     const userPrompt = `任务描述: ${instruction}`;
 
-    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt, { department: "evidence" });
     const needWebSearch = raw.needWebSearch === true;
     return {
       needWebSearch,
@@ -436,7 +436,15 @@ export class EvidenceAgent extends DepartmentAgentRuntime {
       "}",
     ].join("\n");
 
+    const routingSection = this.buildRoutingPromptSection({
+      taskId: data.taskInfo.taskId,
+      bossInstruction: "",
+      dependencies: {},
+      taskInfo: data.taskInfo,
+    });
+
     const userPrompt = [
+      routingSection ? `${routingSection}\n` : "",
       `webResearch.summary: ${data.webResearch.summary}`,
       `feasibility.score: ${data.feasibility.score}`,
       `feasibility.timelineEstimate: ${data.feasibility.timelineEstimate}`,
@@ -445,7 +453,7 @@ export class EvidenceAgent extends DepartmentAgentRuntime {
       `webResearch(JSON): ${JSON.stringify(data.webResearch).slice(0, 2500)}`,
     ].join("\n");
 
-    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt, { department: "evidence" });
     return {
       executiveSummary: ensureString(raw.executiveSummary, `${data.webResearch.summary}。`),
       detailedAnalysis: ensureString(raw.detailedAnalysis, `复杂度=${data.taskInfo.complexity}，可行性评分=${data.feasibility.score}`),

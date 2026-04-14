@@ -83,8 +83,15 @@ export class ExecutionOrchestrator {
 
         if (result.status === "fulfilled") {
           outputs.push(result.value);
-          succeeded.push(department);
-          this.monitor.departmentSucceeded(taskPlan.taskId, department);
+          // base-agent.run() 在 catch 中返回 failedOutput（不 throw），
+          // 所以 fulfilled 不等于成功，需要检查 status 字段。
+          if (result.value.status === "failed") {
+            failed.push(department);
+            this.monitor.departmentFailed(taskPlan.taskId, department, String(result.value.output?.error ?? "unknown"));
+          } else {
+            succeeded.push(department);
+            this.monitor.departmentSucceeded(taskPlan.taskId, department);
+          }
           continue;
         }
 

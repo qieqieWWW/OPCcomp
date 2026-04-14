@@ -63,10 +63,9 @@
 | **文件** | `competition_router/src/opc_router/small_model.py` + `scripts/classifier/` |
 | **核心类** | `SmallModelRouter`, `ComplexityClassifier` |
 | **技术方案** | **Qwen3-1.7B 本地小模型 + LoRA 微调适配器** |
-| **工作原理** | 加载本地 Qwen3-1.7B（Apple Silicon MPS 加速），叠加自定义 LoRA 适配器（`scripts/training/output/adapter/adapter_model`），对用户输入进行复杂度评分 → 输出 L1/L2/L3 三级分级 |
+| **工作原理** | 加载本地 Qwen3-1.7B，叠加自定义 LoRA 适配器（`scripts/training/output/adapter/adapter_model`），对用户输入进行复杂度评分 → 输出 L1/L2/L3 三级分级 |
 | **L1/L2/L3 含义** | L1=简单任务(快速通道)，L2=标准分析(全流程)，L3=复杂项目(深度评估) |
-| **关键设计决策** | **严格禁止回退到规则引擎**——如果小模型加载失败直接报错，不降级到模板匹配，保证每条路由都有语义理解参与 |
-| **创新点** | 用 1.7B 参数量模型替代传统关键词分类，实现零样本意图理解；LoRA 适配器让通用 Qwen3 变成领域专家 |
+| **创新点** | 用 1.7B 参数量本地部署小模型替代传统关键词分类，实现零样本零成本意图理解；LoRA 适配器让通用 Qwen3 变成领域专家 |
 
 ---
 
@@ -401,7 +400,6 @@
 | 小模型参数量 | 1.7B (Qwen3 + LoRA) |
 | 最大自修正轮数 | 3 |
 | 证据TTL | 30天 |
-| 飞书去重窗口 | 5分钟 |
 | 部门DAG最大深度 | 4层（evidence→feasibility/risk→legal）|
 | 质量评分维度 | 4维（completeness/depth/consistency/actionable）|
 | 融合策略 | 4种（consensus/weighted/priority/comprehensive）|

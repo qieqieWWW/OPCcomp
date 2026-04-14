@@ -1,5 +1,5 @@
 import type { DepartmentName } from "../../department-agents/base-agent";
-import type { BrainRouterOutput, TaskPlan, TierLevel } from "./types";
+import type { BrainRouterOutput, TaskPlan, TaskPlanContextData, TierLevel } from "./types";
 
 const AGENT_TO_DEPARTMENT: Record<string, DepartmentName> = {
   evidence_agent: "evidence",
@@ -22,19 +22,29 @@ export class BrainPlanAdapter {
     const departments = this.extractDepartments(brain);
     const dependencies = this.extractDependencies(brain, departments);
 
+    const contextData: TaskPlanContextData = {
+      infoPoolHits: (brain.info_pool_hits ?? []) as Array<Record<string, unknown>>,
+      selectedExperts: (brain.selected_experts ?? []) as Array<Record<string, unknown>>,
+      outputAttribution: (brain.output_attribution ?? {}) as Record<string, unknown>,
+      runtimeTrace: (brain.runtime_trace ?? {}) as Record<string, unknown>,
+      rawBrainOutput: brain as Record<string, unknown>,
+    };
+
+    // 精准路由上下文：仅在数据存在时添加
+    if (brain.intent) {
+      contextData.intent = brain.intent as TaskPlanContextData["intent"];
+    }
+    if (brain.research_fusion) {
+      contextData.researchFusion = brain.research_fusion as Record<string, unknown>;
+    }
+
     return {
       taskId,
       bossInstruction,
       tier,
       departments,
       dependencies,
-      contextData: {
-        infoPoolHits: (brain.info_pool_hits ?? []) as Array<Record<string, unknown>>,
-        selectedExperts: (brain.selected_experts ?? []) as Array<Record<string, unknown>>,
-        outputAttribution: (brain.output_attribution ?? {}) as Record<string, unknown>,
-        runtimeTrace: (brain.runtime_trace ?? {}) as Record<string, unknown>,
-        rawBrainOutput: brain as Record<string, unknown>,
-      },
+      contextData,
     };
   }
 

@@ -9,7 +9,7 @@ export type FusionStrategy = "consensus" | "weighted" | "priority" | "comprehens
 
 export type FusionType = "llm-based-fusion" | "local-fallback-fusion" | "rule-based-fusion";
 
-export type FusionMethod = FusionStrategy | "pairranked-fusion" | "llm-genfuser" | "priority-based" | "rule-based-fusion";
+export type FusionMethod = FusionStrategy | "pairranked-fusion" | "llm-genfuser" | "llm-genfuser-qianfan" | "priority-based" | "rule-based-fusion";
 
 export interface FusionConfig {
   strategy: FusionStrategy;

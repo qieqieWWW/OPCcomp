@@ -28,7 +28,8 @@ export class RiskAgent extends DepartmentAgentRuntime {
     const feasibilityData = context.dependencies.feasibility?.output ?? {};
     const legalOutput = await this.blackboard.getDepartmentOutput(context.taskId, "legal");
     const legalData = legalOutput?.output ?? {};
-    const generated = await this.generateRiskByModel(context.bossInstruction, evidenceData, feasibilityData, legalData);
+    const routingSection = this.buildRoutingPromptSection(context);
+    const generated = await this.generateRiskByModel(context.bossInstruction, evidenceData, feasibilityData, legalData, routingSection);
 
     return {
       department: "risk",
@@ -55,6 +56,7 @@ export class RiskAgent extends DepartmentAgentRuntime {
     evidenceData: Record<string, unknown>,
     feasibilityData: Record<string, unknown>,
     legalData: Record<string, unknown>,
+    routingSection: string,
   ): Promise<RiskAssessment> {
     const systemPrompt = [
       "你是创业项目风险评估顾问。",
@@ -72,13 +74,14 @@ export class RiskAgent extends DepartmentAgentRuntime {
     ].join("\n");
 
     const userPrompt = [
+      routingSection ? `${routingSection}\n` : "",
       `老板任务: ${bossInstruction}`,
       `evidence 输出(JSON): ${JSON.stringify(evidenceData).slice(0, 4500)}`,
       `feasibility 输出(JSON): ${JSON.stringify(feasibilityData).slice(0, 4500)}`,
       `legal 输出(JSON): ${JSON.stringify(legalData).slice(0, 4500)}`,
     ].join("\n\n");
 
-    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt, { department: "risk" });
     return {
       riskLevel: ensureString(raw.riskLevel, "medium") as "low" | "medium" | "high",
       riskSummary: ensureString(raw.riskSummary, "待模型补全"),

@@ -35,7 +35,8 @@ export class FeasibilityAgent extends DepartmentAgentRuntime {
 
   async execute(context: AgentContext): Promise<DepartmentOutput> {
     const evidenceData = context.dependencies.evidence?.output ?? {};
-    const generated = await this.generateStrategyByModel(context.bossInstruction, evidenceData);
+    const routingSection = this.buildRoutingPromptSection(context);
+    const generated = await this.generateStrategyByModel(context.bossInstruction, evidenceData, routingSection);
 
     return {
       department: "feasibility",
@@ -61,6 +62,7 @@ export class FeasibilityAgent extends DepartmentAgentRuntime {
   private async generateStrategyByModel(
     bossInstruction: string,
     evidenceData: Record<string, unknown>,
+    routingSection: string,
   ): Promise<{
     feasibility_score: number;
     market_feasibility: string;
@@ -87,11 +89,12 @@ export class FeasibilityAgent extends DepartmentAgentRuntime {
     ].join("\n");
 
     const userPrompt = [
+      routingSection ? `${routingSection}\n` : "",
       `老板任务: ${bossInstruction}`,
       `evidence 输出(JSON): ${JSON.stringify(evidenceData).slice(0, 6000)}`,
     ].join("\n\n");
 
-    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt, { department: "feasibility" });
     const feasibilityScore = ensureNumber(raw.feasibility_score, 0);
 
     return {

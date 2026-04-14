@@ -140,6 +140,17 @@ export class OpenClawRuntime {
             backend: brainOutput.small_model?.backend ?? "unknown",
             backendReason: brainOutput.small_model?.backend_reason ?? "",
           },
+          // ── 精准路由上下文：注入到 taskInfo.metadata，供各 Agent prompt 消费 ──
+          routingContext: {
+            intent: brainOutput.intent ?? {},
+            researchFusion: brainOutput.research_fusion ?? {},
+            // 透传完整的 KG 命中内容（因果规律、节点信息），而非仅数量
+            knowledgeGraphHits: brainOutput.knowledge_graph_hits ?? [],
+            infoPoolHits: brainOutput.info_pool_hits ?? [],
+            // 向后兼容：保留数量字段
+            knowledgeGraphHitCount: brainOutput.knowledge_graph_hits?.length ?? 0,
+            infoPoolHitCount: brainOutput.info_pool_hits?.length ?? 0,
+          },
         },
       });
     }

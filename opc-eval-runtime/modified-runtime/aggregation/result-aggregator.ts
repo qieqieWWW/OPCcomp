@@ -154,7 +154,12 @@ export class ResultAggregator {
     // 🔍 诊断：第一时间打印 externalEvidence 传入状态
     console.log(`[ResultAggregator] aggregate() 入口: externalEvidence 长度=${input.externalEvidence?.length ?? "undefined"}, 类型=${typeof input.externalEvidence}`);
     if (input.externalEvidence && input.externalEvidence.length > 0) {
-      console.log(`[ResultAggregator] aggregate() externalEvidence[0] keys=[${Object.keys(input.externalEvidence![0]).join(",")}]`, JSON.stringify(input.externalEvidence![0]).slice(0, 200));
+      const firstSample = input.externalEvidence[0];
+      if (firstSample && typeof firstSample === "object") {
+        console.log(`[ResultAggregator] aggregate() externalEvidence[0] keys=[${Object.keys(firstSample).join(",")}]`, JSON.stringify(firstSample).slice(0, 200));
+      } else {
+        console.log(`[ResultAggregator] aggregate() externalEvidence[0] is not an object`, String(firstSample));
+      }
     }
     const cards = input.outputs.map((output) => this.buildCard(output));
     const byDepartment = this.indexOutputs(input.outputs);
@@ -539,14 +544,35 @@ export class ResultAggregator {
     }
 
     const conflicts: EvidenceBoundOutput["conflicts"] = [];
+    // 检查是否有 Agent 离线（AgentOfflineError 导致的失败）
+    const agentOffline = input.execution.failed.some((dept) => {
+      const deptOutput = input.outputs.find((o) => o.department === dept);
+      return deptOutput?.metadata?.agentOffline === true;
+    });
+
     if (input.execution.failed.length > 0) {
-      conflicts.push({
-        conflict_id: "CFL-001",
-        claim_ids: claims.slice(0, 2).map((item) => item.claim_id),
-        evidence_ids: primaryEvidenceIds.slice(0, 2),
-        reason: `${input.execution.failed.length} 个部门执行失败，需要复核输出一致性。`,
-        resolution: "补齐失败部门输出后重新聚合。",
-      });
+      // 如果是 Agent 离线，给出特定冲突原因
+      if (agentOffline) {
+        const offlineDepts = input.execution.failed.filter((dept) => {
+          const deptOutput = input.outputs.find((o) => o.department === dept);
+          return deptOutput?.metadata?.agentOffline === true;
+        });
+        conflicts.push({
+          conflict_id: "CFL-003",
+          claim_ids: claims.slice(0, 2).map((item) => item.claim_id),
+          evidence_ids: primaryEvidenceIds.slice(0, 2),
+          reason: `Agent 离线：${offlineDepts.join(", ")} 部门 Agent 无法连接（HTTP 错误），不是证据不足。`,
+          resolution: "检查 Agent 服务状态和网络连接后重试。",
+        });
+      } else {
+        conflicts.push({
+          conflict_id: "CFL-001",
+          claim_ids: claims.slice(0, 2).map((item) => item.claim_id),
+          evidence_ids: primaryEvidenceIds.slice(0, 2),
+          reason: `${input.execution.failed.length} 个部门执行失败，需要复核输出一致性。`,
+          resolution: "补齐失败部门输出后重新聚合。",
+        });
+      }
     }
 
     if (!fusedResult && cards.length > 0) {
@@ -565,14 +591,17 @@ export class ResultAggregator {
     const staleEvidence = evidenceRegistry.some((entry) => isEvidenceStale(entry, nowMs));
     const noEvidence = claims.length === 0 || claims.some((item) => item.evidence_ids.length === 0) || missingEvidenceLink;
     const conflictPresent = conflicts.length > 0;
-    const degraded = noEvidence || staleEvidence || conflictPresent;
-    const degradeReason = noEvidence
-      ? "NO_EVIDENCE"
-      : conflictPresent
-        ? "EVIDENCE_CONFLICT"
-        : staleEvidence
-          ? "STALE_EVIDENCE"
-          : "";
+    const degraded = noEvidence || staleEvidence || conflictPresent || agentOffline;
+    // AGENT_OFFLINE 优先级最高：Agent 离线 > 证据冲突 > 无证据 > 过期证据
+    const degradeReason = agentOffline
+      ? "AGENT_OFFLINE"
+      : noEvidence
+        ? "NO_EVIDENCE"
+        : conflictPresent
+          ? "EVIDENCE_CONFLICT"
+          : staleEvidence
+            ? "STALE_EVIDENCE"
+            : "";
     const coverage = claims.length === 0
       ? 0
       : Math.round((claims.filter((item) => item.evidence_ids.length > 0).length / claims.length) * 10000) / 10000;

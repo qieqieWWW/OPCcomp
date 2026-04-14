@@ -34,7 +34,8 @@ export class LegalAgent extends DepartmentAgentRuntime {
   async execute(context: AgentContext): Promise<DepartmentOutput> {
     const evidenceData = context.dependencies.evidence?.output ?? {};
     const riskData = context.dependencies.risk?.output ?? {};
-    const generated = await this.generateLegalByModel(context.bossInstruction, evidenceData, riskData);
+    const routingSection = this.buildRoutingPromptSection(context);
+    const generated = await this.generateLegalByModel(context.bossInstruction, evidenceData, riskData, routingSection);
 
     return {
       department: "legal",
@@ -58,6 +59,7 @@ export class LegalAgent extends DepartmentAgentRuntime {
     bossInstruction: string,
     evidenceData: Record<string, unknown>,
     riskData: Record<string, unknown>,
+    routingSection: string,
   ): Promise<{ risks: LegalRisks; compliance: ComplianceIssues; ip: IPStrategy }> {
     const systemPrompt = [
       "你是法律合规顾问。",
@@ -72,12 +74,13 @@ export class LegalAgent extends DepartmentAgentRuntime {
     ].join("\n");
 
     const userPrompt = [
+      routingSection ? `${routingSection}\n` : "",
       `老板任务: ${bossInstruction}`,
       `evidence 输出(JSON): ${JSON.stringify(evidenceData).slice(0, 6000)}`,
       `risk 输出(JSON): ${JSON.stringify(riskData).slice(0, 6000)}`,
     ].join("\n\n");
 
-    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt, { department: "legal" });
     const risksRaw = (raw.risks && typeof raw.risks === "object") ? raw.risks as Record<string, unknown> : {};
     const complianceRaw = (raw.compliance && typeof raw.compliance === "object") ? raw.compliance as Record<string, unknown> : {};
     const ipRaw = (raw.ip && typeof raw.ip === "object") ? raw.ip as Record<string, unknown> : {};

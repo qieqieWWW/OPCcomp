@@ -491,9 +491,21 @@ class AccuracyEvaluator:
         """
         contradictions: List[Dict[str, Any]] = []
         try:
-            from m7_knowledge_graph import get_kg_engine
-            engine = get_kg_engine()
-            if not engine or not engine.is_loaded:
+            kg_mod = None
+            for mod_name in ("m7_knowledge_graph", "scripts.m7.m7_knowledge_graph"):
+                try:
+                    kg_mod = importlib.import_module(mod_name)
+                    break
+                except Exception:
+                    kg_mod = None
+
+            engine = None
+            if kg_mod:
+                get_kg_engine = getattr(kg_mod, "get_kg_engine", None)
+                if callable(get_kg_engine):
+                    engine = get_kg_engine()
+
+            if not engine or not getattr(engine, "is_loaded", False):
                 return contradictions
 
             for stmt in statements:
@@ -671,7 +683,21 @@ class AccuracyGate:
         if self._kg_engine is not None:
             return self._kg_engine
         try:
-            from m7_knowledge_graph import get_kg_engine
+            kg_mod = None
+            for mod_name in ("m7_knowledge_graph", "scripts.m7.m7_knowledge_graph"):
+                try:
+                    kg_mod = importlib.import_module(mod_name)
+                    break
+                except Exception:
+                    kg_mod = None
+
+            if not kg_mod:
+                return None
+
+            get_kg_engine = getattr(kg_mod, "get_kg_engine", None)
+            if not callable(get_kg_engine):
+                return None
+
             self._kg_engine = get_kg_engine()
             return self._kg_engine
         except Exception:

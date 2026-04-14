@@ -36,6 +36,86 @@ const RANKER_MODEL = "pairranker-heuristic-v1";
 const FUSER_MODEL = "genfuser-heuristic-v1";
 const DEFAULT_TOP_K = 5;
 
+// ── 千帆 App Runs API 辅助函数 ─────────────────────────────────────
+
+function readEnv(name: string): string | undefined {
+  const maybeProcess = globalThis as { process?: { env?: Record<string, string | undefined> } };
+  return maybeProcess.process?.env?.[name];
+}
+
+async function qianfanSign(bodyStr: string, secretKey: string, requestId: string, signTime: string): Promise<string> {
+  const data = new TextEncoder().encode(`${bodyStr}${secretKey}${requestId}${signTime}`);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function qianfanHeaders(bodyStr: string): Promise<Record<string, string>> {
+  const authMode = (readEnv("QIANFAN_AUTH_MODE") ?? "signature").toLowerCase();
+  const bearerToken = readEnv("QIANFAN_BEARER_TOKEN") ?? "";
+  if (authMode === "bearer" && bearerToken) {
+    return { "Content-Type": "application/json", Authorization: `Bearer ${bearerToken}` };
+  }
+  const accessKey = readEnv("QIANFAN_ACCESS_KEY") ?? "";
+  const secretKey = readEnv("QIANFAN_SECRET_KEY") ?? "";
+  const requestId = crypto.randomUUID().replace(/-/g, "");
+  const signTime = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const token = await qianfanSign(bodyStr, secretKey, requestId, signTime);
+  return {
+    "Content-Type": "application/json",
+    "X-Bce-Request-ID": requestId,
+    "Access-Key": accessKey,
+    "Sign-Time": signTime,
+    Token: token,
+  };
+}
+
+/**
+ * 调用千帆 App Runs API 做融合推理。
+ * 使用 evidence-agent 作为通用 LLM 通道。
+ */
+async function callQianfanFusion(prompt: string, config: FusionConfig): Promise<string> {
+  const host = (readEnv("QIANFAN_HOST") ?? "").replace(/\/$/, "");
+  if (!host) throw new Error("QIANFAN_HOST 未配置");
+  // 使用 evidence-agent 做融合（它擅长信息综合）
+  const appId = "dae4fbab-4e20-47ca-9d8b-10afe052f999";
+
+  // 新建会话
+  const convBody = JSON.stringify({ app_id: appId });
+  const convResp = await fetch(`${host}/api/ai_apaas/v1/app/conversation`, {
+    method: "POST", headers: await qianfanHeaders(convBody), body: convBody,
+  });
+  if (!convResp.ok) {
+    const raw = await convResp.text();
+    throw new Error(`千帆新建会话失败: ${convResp.status} ${raw.slice(0, 200)}`);
+  }
+  const { conversation_id } = await convResp.json() as { conversation_id?: string };
+  if (!conversation_id) throw new Error("千帆未返回 conversation_id");
+
+  // 发送对话
+  const query = `[系统指令]\nYou synthesize multiple departmental outputs into one coherent, execution-oriented result. Respond in the same language as the input.\n\n[用户请求]\n${prompt}`;
+  const runBody = JSON.stringify({ app_id: appId, query, stream: false, conversation_id: conversation_id });
+  const runResp = await fetch(`${host}/api/ai_apaas/v1/app/conversation/runs`, {
+    method: "POST", headers: await qianfanHeaders(runBody), body: runBody,
+  });
+  if (!runResp.ok) {
+    const raw = await runResp.text();
+    throw new Error(`千帆对话失败: ${runResp.status} ${raw.slice(0, 200)}`);
+  }
+  const runData = await runResp.json() as { answer?: string; content?: Array<{ outputs?: { text?: string } }> };
+  let answer = runData.answer ?? "";
+  if (!answer && Array.isArray(runData.content)) {
+    answer = runData.content
+      .map((item) => {
+        const t = (item as Record<string, unknown>).outputs;
+        return t && typeof t === "object" ? String((t as Record<string, unknown>).text ?? "") : "";
+      })
+      .join("\n");
+  }
+  return answer.trim();
+}
+
+// ── 主 Adapter ──────────────────────────────────────────────────────
+
 export class LLMBlenderAdapter implements BlenderAdapter {
   private apiKey = "";
   private model = "gpt-4";
@@ -73,6 +153,29 @@ export class LLMBlenderAdapter implements BlenderAdapter {
     const localFallback = this.buildLocalFusion(rankedCandidates, config.strategy, strategyFrame.instruction);
 
     if (!this.apiKey || !this.resolveFetch()) {
+      // 尝试千帆回退
+      const qianfanHost = readEnv("QIANFAN_HOST") ?? "";
+      if (qianfanHost) {
+        console.log("[LLMBlenderAdapter] 无 OpenAI API Key，尝试千帆后端融合...");
+        try {
+          const fusedContent = await callQianfanFusion(prompt, config);
+          return this.buildResult({
+            resultType: "llm-based-fusion",
+            fusedContent: fusedContent || localFallback,
+            fusionMethod: "llm-genfuser-qianfan",
+            sourceDepartments,
+            rankedCandidates,
+            pairwiseComparisons,
+            startedAt,
+            tokenUsage: 0,
+            reasoning: config.includeReasoning ? strategyFrame.instruction : null,
+            rankingStrategy: config.strategy,
+            modelUsed: "qianfan-app",
+          });
+        } catch (qfErr) {
+          console.warn(`[LLMBlenderAdapter] 千帆融合也失败了，降级为本地回退: ${(qfErr as Error).message}`);
+        }
+      }
       return this.buildResult({
         resultType: "local-fallback-fusion",
         fusedContent: localFallback,

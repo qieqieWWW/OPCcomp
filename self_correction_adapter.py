@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import importlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -50,11 +51,29 @@ class SelfCorrectionAdapter:
 
         # 定义信息池检索函数
         def retrieve_from_info_pool(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-            """从信息池中检索相关信息"""
-            from info_pool import _cos, _vec  # 使用已有的检索逻辑
+            """从信息池中检索相关信息；在缺少检索模块时安全退化为空列表。"""
+            # 尝试动态导入 info_pool 检索实现，避免静态导入导致 IDE 报错
+            _cos = None
+            _vec = None
+            try:
+                imp = importlib.import_module("info_pool")
+                _cos = getattr(imp, "_cos", None)
+                _vec = getattr(imp, "_vec", None)
+            except Exception:
+                try:
+                    imp = importlib.import_module("competition_router.src.opc_router.info_pool")
+                    _cos = getattr(imp, "_cos", None)
+                    _vec = getattr(imp, "_vec", None)
+                except Exception:
+                    _cos = None
+                    _vec = None
+
+            if not callable(_cos) or not callable(_vec):
+                # 无法找到检索实现，返回空（安全退化）
+                return []
 
             qv = _vec(query)
-            scored = []
+            scored: List[tuple] = []
 
             for rec in self.info_pool:
                 text = " ".join([
@@ -63,12 +82,15 @@ class SelfCorrectionAdapter:
                     " ".join(str(k) for k in rec.get("keywords", []) if isinstance(k, str)),
                     str(rec.get("guideline", "")),
                 ])
-                score = _cos(qv, _vec(text))
+                try:
+                    score = _cos(qv, _vec(text))
+                except Exception:
+                    score = 0
                 if score > 0:
                     scored.append((score, rec))
 
             scored.sort(key=lambda x: x[0], reverse=True)
-            return [{"score": round(s, 4), "record": r} for s, r in scored[:top_k]]
+            return [{"score": round(float(s), 4), "record": r} for s, r in scored[:top_k]]
 
         self.info_pool_retriever = retrieve_from_info_pool
 

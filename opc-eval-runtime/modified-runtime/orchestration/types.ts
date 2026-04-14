@@ -10,6 +10,10 @@ export interface TaskPlanContextData {
   outputAttribution?: Record<string, unknown>;
   runtimeTrace?: Record<string, unknown>;
   rawBrainOutput?: Record<string, unknown>;
+  /** 来自 Python 小模型的意图识别结果 */
+  intent?: { type?: string; confidence?: number; reason?: string } | undefined;
+  /** 来自 Python research_fusion 的增强信号 */
+  researchFusion?: Record<string, unknown> | undefined;
 }
 
 export interface TaskPlan {
@@ -275,11 +279,15 @@ export interface BrainRouterOutput {
     backend?: string;
     backend_reason?: string;
   };
+  intent?: { type?: string; confidence?: number; reason?: string };
   selected_experts?: Array<Record<string, unknown>>;
   collaboration_plan?: {
     edges?: Array<Record<string, unknown>>;
   };
   info_pool_hits?: Array<Record<string, unknown>>;
+  knowledge_graph_hits?: Array<Record<string, unknown>>;
+  research_fusion?: Record<string, unknown>;
+  ranked_candidates?: Array<Record<string, unknown>>;
   output_attribution?: Record<string, unknown>;
   runtime_trace?: Record<string, unknown>;
   source?: string;

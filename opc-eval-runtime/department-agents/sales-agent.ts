@@ -33,7 +33,8 @@ export class SalesAgent extends DepartmentAgentRuntime {
 
   async execute(context: AgentContext): Promise<DepartmentOutput> {
     const marketPlan = context.dependencies.market?.output ?? {};
-    const generated = await this.generateSalesByModel(context.bossInstruction, marketPlan);
+    const routingSection = this.buildRoutingPromptSection(context);
+    const generated = await this.generateSalesByModel(context.bossInstruction, marketPlan, routingSection);
 
     return {
       department: "sales",
@@ -56,6 +57,7 @@ export class SalesAgent extends DepartmentAgentRuntime {
   private async generateSalesByModel(
     bossInstruction: string,
     marketData: Record<string, unknown>,
+    routingSection: string,
   ): Promise<{ strategy: SalesStrategy; profiles: CustomerProfiles; conversion: ConversionPlan }> {
     const systemPrompt = [
       "你是销售策略顾问。",
@@ -70,11 +72,12 @@ export class SalesAgent extends DepartmentAgentRuntime {
     ].join("\n");
 
     const userPrompt = [
+      routingSection ? `${routingSection}\n` : "",
       `老板任务: ${bossInstruction}`,
       `market 输出(JSON): ${JSON.stringify(marketData).slice(0, 6000)}`,
     ].join("\n\n");
 
-    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt);
+    const raw = await requestModelJson<Record<string, unknown>>(systemPrompt, userPrompt, { department: "evidence" });
     const strategyRaw = (raw.strategy && typeof raw.strategy === "object") ? raw.strategy as Record<string, unknown> : {};
     const profilesRaw = (raw.profiles && typeof raw.profiles === "object") ? raw.profiles as Record<string, unknown> : {};
     const conversionRaw = (raw.conversion && typeof raw.conversion === "object") ? raw.conversion as Record<string, unknown> : {};
